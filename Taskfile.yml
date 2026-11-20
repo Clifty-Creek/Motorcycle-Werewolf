@@ -1,8 +1,7 @@
 version: "3"
 
 vars:
-  DIST: dist
-  BRANCH: gh-pages
+  SITE: docs
   REMOTE: origin
 
 tasks:
@@ -22,40 +21,32 @@ tasks:
       - blender --background --python build_werewolf.py
 
   site:
-    desc: Assemble the static site in {{.DIST}}/
+    desc: Assemble the static site in {{.SITE}}/
     preconditions:
       - sh: test -f werewolf.glb
         msg: werewolf.glb is missing, run `task build` first
     cmds:
-      - rm -rf {{.DIST}}
-      - mkdir -p {{.DIST}}
-      - cp viewer.html {{.DIST}}/index.html
-      - cp werewolf.glb {{.DIST}}/
+      - mkdir -p {{.SITE}}
+      - cp viewer.html {{.SITE}}/index.html
+      - cp werewolf.glb {{.SITE}}/
       # Stop GitHub Pages from running the files through Jekyll
-      - touch {{.DIST}}/.nojekyll
+      - touch {{.SITE}}/.nojekyll
 
   serve:
     desc: Preview the assembled site at http://localhost:8000
     deps: [site]
     cmds:
-      - python3 -m http.server 8000 --directory {{.DIST}}
+      - python3 -m http.server 8000 --directory {{.SITE}}
 
   publish:
-    desc: Build the model and site, then force-push {{.DIST}}/ to the {{.BRANCH}} branch
+    desc: Build the model and site, then commit {{.SITE}}/ and push the current branch
     preconditions:
       - sh: git remote get-url {{.REMOTE}}
         msg: No `{{.REMOTE}}` remote, add one with `git remote add {{.REMOTE}} <url>`
-    vars:
-      URL:
-        sh: git remote get-url {{.REMOTE}} 2>/dev/null || true
-      REV:
-        sh: git rev-parse --short HEAD 2>/dev/null || echo uncommitted
     cmds:
       - task: build
       - task: site
-      # A throwaway repo keeps the branch to a single commit, so old GLBs do not pile up in history
-      - git -C {{.DIST}} init --quiet --initial-branch {{.BRANCH}}
-      - git -C {{.DIST}} add --all
-      - git -C {{.DIST}} commit --quiet --message "Publish {{.REV}}"
-      - git -C {{.DIST}} push --force {{.URL}} {{.BRANCH}}
-      - rm -rf {{.DIST}}/.git
+      - git add {{.SITE}}
+      # Commit only the site folder, and only when it changed
+      - git diff --cached --quiet -- {{.SITE}} || git commit --quiet --message "Publish site" -- {{.SITE}}
+      - git push {{.REMOTE}} HEAD

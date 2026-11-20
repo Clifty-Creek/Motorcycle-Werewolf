@@ -4,5 +4,4 @@
 .playwright-mcp/
 
 # Taskfile outputs
-dist/
 .task/
