@@ -1455,7 +1455,7 @@ function pressKey(code) {
 addEventListener("pointerup", () => soundAt());  // phones only let sound start when a touch ends
 
 // Double tap or double click the ground to send the wolf there; a ring marks the spot until it arrives.
-// Double tap the motorcycle to walk over and get on, or to get off again
+// Double tap the motorcycle to walk over and get on, or to get off again. A triple tap gallops there
 const TAP_TIME = 350, TAP_SLOP = 24, GOAL_REACH = 0.3, GOAL_RUN = 6, BIKE_TAP = 1;  // milliseconds, pixels, and metres to arrive, to run from, and around the motorcycle
 const marker = new THREE.Mesh(new THREE.RingGeometry(0.22, 0.3, 32).rotateX(-Math.PI / 2),
                               new THREE.MeshBasicMaterial({ color: 0xc9d4ee, transparent: true, opacity: 0.7, fog: false }));
@@ -1474,9 +1474,11 @@ renderer.domElement.addEventListener("pointerup", (e) => {
   const tap = press && e.isPrimary && e.timeStamp - press.time < TAP_TIME && Math.hypot(e.clientX - press.x, e.clientY - press.y) < TAP_SLOP;
   press = null;
   if (!tap) { lastTap = null; return; }
-  const second = lastTap && e.timeStamp - lastTap.time < TAP_TIME && Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < TAP_SLOP;
-  lastTap = second ? null : { x: e.clientX, y: e.clientY, time: e.timeStamp };
-  if (!second || !pelvis) return;
+  const again = lastTap && e.timeStamp - lastTap.time < TAP_TIME && Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < TAP_SLOP;
+  lastTap = { x: e.clientX, y: e.clientY, time: e.timeStamp, count: again ? lastTap.count + 1 : 1 };
+  if (lastTap.count < 2 || !pelvis) return;
+  // A third tap hurries the wolf to the spot the second one chose
+  if (lastTap.count > 2) { if (errand) errand.gallop = true; return; }
   ray.setFromCamera(tapPoint.set(2 * e.clientX / innerWidth - 1, 1 - 2 * e.clientY / innerHeight), camera);
   const hit = ray.intersectObject(ground)[0];
   // A tap on the motorcycle, or on the ground right beside it, is meant for the motorcycle
@@ -1564,7 +1566,7 @@ renderer.setAnimationLoop(() => {
   // With dancing off the wolf stands in its rest pose instead of returning to the dance
   blend += ((moving || airborne || riding || !dancing ? 1 : 0) - blend) * Math.min(1, (airborne ? 3 : 1) * BLEND_RATE * dt);
   runBlend += ((moving && (running || stickRun || errand?.far) ? 1 : 0) - runBlend) * Math.min(1, BLEND_RATE * dt);
-  gallopBlend += ((moving && galloping ? 1 : 0) - gallopBlend) * Math.min(1, BLEND_RATE * dt);
+  gallopBlend += ((moving && (galloping || errand?.gallop) ? 1 : 0) - gallopBlend) * Math.min(1, BLEND_RATE * dt);
   // A bite or a howl works the jaw from its open rest, so let it fall open for those
   mouthShut += ((bite < 0 && howl < 0 ? 0.8 * (1 - Math.max(runBlend, gallopBlend, rideBlend * Math.abs(bike.speed) / BIKE_SPEED)) : 0) - mouthShut) * Math.min(1, 2 * BLEND_RATE * dt);
   if (moving) {
