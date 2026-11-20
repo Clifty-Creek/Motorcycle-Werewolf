@@ -1,0 +1,1508 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Werewolf</title>
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+               "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/" } }
+</script>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0a0f1c; }
+  canvas { display: block; }
+  .pill { position: fixed; padding: 6px 14px; border-radius: 999px; background: rgba(10, 15, 28, 0.6); color: #c9d4ee;
+          font: 13px/1.4 system-ui, sans-serif; pointer-events: none; }
+  #hint { left: 50%; bottom: 18px; transform: translateX(-50%); max-width: calc(100% - 32px); text-align: center; }
+  #score { left: 18px; top: 18px; font-size: 15px; }
+</style>
+</head>
+<body>
+<!-- Serve this folder over HTTP (python3 -m http.server) because browsers block loading the GLB from file:// -->
+<div id="score" class="pill">Sheep caught: 0</div>
+<div id="hint" class="pill"></div>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { DRACOLoader } from "three/addons/loaders/DRACOLoader.js";
+import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
+import { mergeVertices } from "three/addons/utils/BufferGeometryUtils.js";
+import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
+import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
+import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
+
+const WALK_SPEED = 1.3, RUN_SPEED = 3.2;  // metres per second
+const GALLOP_SPEED = 7.8, GALLOP_STRIDE = 2.8;  // metres per second and metres per bound on all fours
+const STRIDE = 1.15;  // metres covered by one full walk cycle, keeps the feet from sliding
+const TURN_RATE = 10, BLEND_RATE = 7;  // how quickly the wolf turns and eases between dancing and walking
+const JUMP_SPEED = 4.4, GRAVITY = 13;  // launch speed in metres per second and pull in metres per second squared
+const BITE_TIME = 0.6, BITE_REACH = 1.3;  // seconds for one attack and metres the wolf lunges forward during it
+const HOWL_TIME = 2.8, HOWL_RANGE = 40;  // seconds a howl lasts and metres within which it scares the sheep
+const JAW_SHUT = 13, JAW_WIDE = 14;  // degrees the jaw swings to close fully and to gape, from its half-open rest
+const PAW_HEIGHT = 0.14;  // metres the wrist sits above the ground when a front paw is planted in the gallop
+const TAIL_BONES = 4, ROAM_RADIUS = 90, WOLF_RADIUS = 0.4;
+const TREE_COUNT = 760, ROCK_COUNT = 120, STUMP_COUNT = 20, LOG_COUNT = 26, CLEARING = 12;  // scenery scattered outside a clearing around the start
+const CELL = 46;  // metres across each square of forest that is drawn or skipped as a whole
+const GRASS_COUNT = 32000, FERN_COUNT = 900, COVER_REACH = 34;  // undergrowth is drawn within this many metres of the camera
+const MIST_COUNT = 40, MIST_REACH = 45;
+const SHEEP_COUNT = 14, SHEEP_SPEED = 5.2, FLEE_DISTANCE = 9, CALM_DISTANCE = 18;  // sheep outrun a run but not a gallop
+const BIKE_SPEED = 14, BIKE_POWER = 6, BIKE_BRAKE = 14, BIKE_REVERSE = 2.5;  // top speed in metres per second, and how fast it gains and sheds speed
+const BIKE_TURN = 3.2, BIKE_LEAN = 0.5, STAND_LEAN = 0.2, BIKE_RADIUS = 0.55;  // tightest turning circle in metres, leans in radians
+const FRONT_AXLE = 1.35, REAR_AXLE = 0.45;  // metres from the saddle forward to the front wheel and back to the rear one
+const HOP_TIME = 0.7, HOP_LAUNCH = 0.2;  // seconds the wolf takes to heave the motorcycle into a jump, and the share of that spent crouching first
+const BIKE_JUMP = 5;  // launch speed in metres per second, enough to clear logs, stumps and boulders
+const MOUNT_REACH = 3, MOUNT_SPEED = 3;  // metres within which the wolf can get on, and the speed below which it can get off
+const RIDE_DROP = 0.24, PEG = { x: 0.3, y: 0.2, z: 0.78 }, GRIP = { x: 0.38, y: 1.18, z: 0.64 };  // how far the hips sink into the saddle, where the ankles and wrists go
+const LOOK_AHEAD = 9, LOOK_INTO_TURN = 0.35;  // metres up the trail the rider watches, and seconds of turning by which the gaze leads a bend
+const RAM_SPEED = 3, RAM_REACH = 0.9;  // the motorcycle bowls over any sheep this close to it when going at least this fast
+const ENGINE_FLEE = 16, ENGINE_CALM = 26, HEADLIGHT = 420;  // sheep hear the engine from farther off than they notice a wolf on foot
+const WALK_HINT = "Arrows or WASD walk · Shift run · G gallop on/off · Space jump (again in the air to go higher) · Enter or X lunge and bite · H howl · P dance on/off · M ride the motorcycle (walk up to it) · drag to orbit";
+const RIDE_HINT = "Up throttle · Down brake, then back up · Left and Right steer · Space jump · Enter or X bite · run sheep down · H howl · M get off (stop first) · drag to orbit";
+const MOON_DIRECTION =new THREE.Vector3(-4, 6.5, 3.6).normalize();
+// Blender armature axes expressed in three.js axes (Blender is Z up and the wolf faces -Y)
+const AXES = { X: new THREE.Vector3(1, 0, 0), Y: new THREE.Vector3(0, 0, -1), Z: new THREE.Vector3(0, 1, 0) };
+const KEYS = { ArrowUp: [0, 1], KeyW: [0, 1], ArrowDown: [0, -1], KeyS: [0, -1],
+               ArrowLeft: [-1, 0], KeyA: [-1, 0], ArrowRight: [1, 0], KeyD: [1, 0] };
+const { lerp, clamp, smoothstep } = THREE.MathUtils;
+
+// Small seeded random generator so the forest is the same on every visit
+let seed = 7;
+function random() {
+  seed = (seed + 0x6d2b79f5) | 0;
+  let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+const between = (low, high) => low + (high - low) * random();
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.3;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+// Shape of the land as formulas of x and z, kept as text so the same ones run here and inside the shaders
+const GROUND = "0.7*sin(0.043*x+1.3)*cos(0.037*z)+0.45*sin(0.09*z+0.031*x+4.0)+0.18*sin(0.21*x-0.17*z)";  // height in metres
+const OPEN = "0.5+0.3*sin(0.061*x+0.5)*cos(0.047*z+1.1)+0.2*sin(0.023*x-0.031*z+2.0)";  // 0 in thick forest to 1 in a glade
+const PATCH = "sin(0.41*x+1.3*sin(0.17*z))*sin(0.37*z+1.1*sin(0.13*x))";  // above 0 where grass and moss grow in patches
+const formula = (text) => new Function("x", "z", `const { sin, cos } = Math; return ${text};`);
+const groundAt = formula(GROUND), openAt = formula(OPEN), patchAt = formula(PATCH);
+const LAND_GLSL = [["groundAt", GROUND], ["openAt", OPEN], ["patchAt", PATCH]].map(([name, text]) => `float ${name}(float x, float z) { return ${text}; }\n`).join("");
+const glsl = (number) => number.toFixed(3);
+
+const scene = new THREE.Scene();
+const haze = new THREE.Color(0x0f1929);
+scene.background = haze;
+scene.fog = new THREE.FogExp2(haze, 0.017);
+scene.environment = new THREE.PMREMGenerator(renderer).fromScene(new RoomEnvironment(), 0.04).texture;
+
+const camera = new THREE.PerspectiveCamera(40, 1, 0.1, 500);
+camera.position.set(2.9, 2.6 + groundAt(0, 0), 5.0);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 1.05 + groundAt(0, 0), 0);
+controls.enablePan = false;
+controls.minDistance = 1.5;
+controls.maxDistance = 20;
+controls.maxPolarAngle = Math.PI / 2 - 0.03;
+controls.update();
+
+// Moonlight with shadows, and a dim blue wash from the sky so the shadows are not black
+const moonlight = new THREE.DirectionalLight(0xbfd2ff, 3.0);
+moonlight.castShadow = true;
+moonlight.shadow.mapSize.set(2048, 2048);
+moonlight.shadow.bias = -0.0004;
+moonlight.shadow.normalBias = 0.04;
+Object.assign(moonlight.shadow.camera, { left: -20, right: 20, top: 20, bottom: -20, near: 1, far: 170 });
+scene.add(moonlight, moonlight.target, new THREE.HemisphereLight(0x3a4f7c, 0x0c0e0a, 0.7));
+
+// Night sky drawn on a dome that travels with the camera: haze at the horizon, stars, a moon with dark seas, drifting cloud
+const wind = { value: 0 };  // seconds since the start, shared by every shader that moves
+const sky = new THREE.Mesh(new THREE.SphereGeometry(400, 32, 16), new THREE.ShaderMaterial({
+  side: THREE.BackSide, depthWrite: false, fog: false,
+  uniforms: { uMoon: { value: MOON_DIRECTION }, uHaze: { value: haze }, uTime: wind },
+  vertexShader: "varying vec3 vDirection; void main() { vDirection = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }",
+  fragmentShader: `
+    varying vec3 vDirection;
+    uniform vec3 uMoon, uHaze;
+    uniform float uTime;
+    float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+    float noise(vec2 p) {
+      vec2 i = floor(p), f = fract(p);
+      f = f * f * (3.0 - 2.0 * f);
+      return mix(mix(hash(i), hash(i + vec2(1, 0)), f.x), mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), f.x), f.y);
+    }
+    float fbm(vec2 p) {
+      float sum = 0.0, weight = 0.5;
+      for (int i = 0; i < 5; i++) { sum += weight * noise(p); p *= 2.03; weight *= 0.5; }
+      return sum;
+    }
+    void main() {
+      vec3 d = normalize(vDirection);
+      float up = max(d.y, 0.0), toMoon = max(dot(d, uMoon), 0.0);
+      vec3 colour = mix(uHaze, vec3(0.006, 0.012, 0.035), pow(up, 0.45));
+      // Stars: one in some cells of a grid laid over the sky, twinkling, fading into the haze near the horizon
+      vec2 cell = d.xz / (0.35 + up) * 70.0, id = floor(cell);
+      float bright = hash(id + 3.1), twinkle = 0.75 + 0.25 * sin(3.0 * uTime + 90.0 * bright);
+      float star = 1.0 - smoothstep(0.0, 0.07, distance(fract(cell), 0.15 + 0.7 * vec2(hash(id), hash(id + 7.3))));
+      colour += star * step(0.8, bright) * pow(bright, 6.0) * 3.0 * twinkle * smoothstep(0.03, 0.35, up);
+      // Moon: a disc shaded toward its rim, with darker seas
+      vec3 right = normalize(cross(uMoon, vec3(0, 1, 0)));
+      vec2 face = vec2(dot(d, right), dot(d, cross(right, uMoon))) / 0.03;
+      float disc = (1.0 - smoothstep(0.94, 1.0, length(face))) * step(0.5, toMoon);
+      vec3 moon = vec3(1.0, 0.98, 0.93) * (0.55 + 0.45 * smoothstep(0.38, 0.62, fbm(1.7 * face + 4.0))) * (0.75 + 0.25 * sqrt(max(0.0, 1.0 - dot(face, face))));
+      colour += vec3(0.07, 0.1, 0.17) * pow(toMoon, 10.0) + vec3(0.2, 0.25, 0.36) * pow(toMoon, 300.0);
+      colour = mix(colour, 2.2 * moon, disc);
+      // Thin cloud, pale where the moon shines through it
+      float cover = smoothstep(0.5, 0.85, fbm(d.xz / (up + 0.15) * 1.3 + 0.006 * uTime)) * smoothstep(0.0, 0.2, up);
+      colour = mix(colour, mix(vec3(0.02, 0.028, 0.045), vec3(0.3, 0.35, 0.47), pow(toMoon, 5.0)), cover * mix(0.8, 0.35, disc));
+      gl_FragColor = vec4(d.y < 0.0 ? uHaze : colour, 1.0);
+      #include <tonemapping_fragment>
+      #include <colorspace_fragment>
+    }`,
+}));
+sky.renderOrder = -1;
+sky.frustumCulled = false;
+scene.add(sky);
+
+// The picture is finished the way eyes and cameras see at night: bright things glow, dim things lose their colour and
+// turn blue, the corners darken, and there is a little grain
+const NIGHT = {
+  uniforms: { tDiffuse: { value: null }, uTime: { value: 0 } },
+  vertexShader: "varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }",
+  fragmentShader: `
+    varying vec2 vUv;
+    uniform sampler2D tDiffuse;
+    uniform float uTime;
+    void main() {
+      vec3 colour = texture2D(tDiffuse, vUv).rgb;
+      float light = dot(colour, vec3(0.2126, 0.7152, 0.0722)), dim = 1.0 - smoothstep(0.0, 0.45, light);
+      colour = mix(colour, light * vec3(0.75, 0.97, 1.3), 0.45 * dim);
+      vec2 fromCentre = vUv - 0.5;
+      colour *= 1.0 - 1.1 * dot(fromCentre, fromCentre);
+      colour *= 0.96 + 0.08 * fract(sin(dot(gl_FragCoord.xy + 61.0 * fract(uTime), vec2(12.9898, 78.233))) * 43758.5453);
+      gl_FragColor = vec4(colour, 1.0);
+    }`,
+};
+const composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, samples: 4 }));
+const night = new ShaderPass(NIGHT);
+composer.setPixelRatio(renderer.getPixelRatio());
+for (const pass of [new RenderPass(scene, camera), new UnrealBloomPass(new THREE.Vector2(1, 1), 0.3, 0.7, 0.75), night, new OutputPass()]) composer.addPass(pass);
+
+// Textures are painted on canvases, so there are no image files to load
+function canvasOf(width, height) {
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  return canvas.getContext("2d");
+}
+function textureOf(context, repeats) {
+  const texture = new THREE.CanvasTexture(context.canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.anisotropy = 8;
+  if (repeats) texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+  return texture;
+}
+// Draw something centred near (x, y) and again on the opposite edges it overhangs, so the texture repeats without seams
+function tiled(context, x, y, reach, draw) {
+  const { width, height } = context.canvas;
+  for (const dx of [-width, 0, width]) {
+    for (const dy of [-height, 0, height]) {
+      if (x + dx < -reach || x + dx > width + reach || y + dy < -reach || y + dy > height + reach) continue;
+      context.setTransform(1, 0, 0, 1, dx, dy);
+      draw();
+    }
+  }
+  context.setTransform(1, 0, 0, 1, 0, 0);
+}
+const hsl = (hue, saturation, lightness, alpha = 1) => `hsla(${hue}, ${saturation}%, ${lightness}%, ${alpha})`;
+function stroke(context, x0, y0, x1, y1) {
+  context.beginPath();
+  context.moveTo(x0, y0);
+  context.lineTo(x1, y1);
+  context.stroke();
+}
+function blotch(context, x, y, radius, colour) {
+  tiled(context, x, y, radius, () => {
+    const fill = context.createRadialGradient(x, y, 0, x, y, radius);
+    fill.addColorStop(0, colour);
+    fill.addColorStop(1, "rgba(0, 0, 0, 0)");
+    context.fillStyle = fill;
+    context.fillRect(x - radius, y - radius, 2 * radius, 2 * radius);
+  });
+}
+
+// Forest floor, three metres to a tile: damp earth and moss under a litter of fallen needles, twigs and small stones
+const soil = canvasOf(512, 512);
+soil.fillStyle = "#2b2219";
+soil.fillRect(0, 0, 512, 512);
+for (let i = 0; i < 260; i++) blotch(soil, between(0, 512), between(0, 512), between(20, 70), random() < 0.35 ? "rgba(58, 76, 32, 0.5)" : "rgba(14, 11, 8, 0.55)");
+for (let i = 0; i < 9000; i++) {
+  const x = between(0, 512), y = between(0, 512), angle = between(0, Math.PI), length = between(5, 11);
+  soil.strokeStyle = hsl(between(18, 40), between(16, 36), between(11, 30));
+  soil.lineWidth = between(1, 1.7);
+  tiled(soil, x, y, 12, () => stroke(soil, x, y, x + length * Math.cos(angle), y + length * Math.sin(angle)));
+}
+for (let i = 0; i < 130; i++) {
+  const x = between(0, 512), y = between(0, 512), angle = between(0, Math.PI), length = between(20, 70);
+  soil.strokeStyle = hsl(25, 20, between(7, 20));
+  soil.lineWidth = between(1.5, 3.5);
+  tiled(soil, x, y, 70, () => stroke(soil, x, y, x + length * Math.cos(angle), y + length * Math.sin(angle)));
+}
+for (let i = 0; i < 500; i++) {
+  const x = between(0, 512), y = between(0, 512), radius = between(1.5, 5), stone = random() < 0.35;
+  soil.fillStyle = stone ? hsl(215, 6, between(24, 44)) : hsl(between(70, 110), 35, between(16, 30));
+  tiled(soil, x, y, 6, () => { soil.beginPath(); soil.ellipse(x, y, radius, radius * between(0.5, 1), between(0, 3), 0, 7); soil.fill(); });
+}
+
+// Bark, about a metre to a tile: dark furrows running up the trunk between paler plates, and spots of lichen
+const barkPaint = canvasOf(256, 512);
+barkPaint.fillStyle = "#4b4136";
+barkPaint.fillRect(0, 0, 256, 512);
+for (let i = 0; i < 700; i++) {
+  const x = between(0, 256), y = between(0, 512), length = between(30, 150), furrow = random() < 0.45;
+  barkPaint.strokeStyle = furrow ? "rgba(7, 5, 4, 0.7)" : hsl(28, 12, between(34, 55), 0.35);
+  barkPaint.lineWidth = furrow ? between(2, 6) : between(1.5, 4);
+  tiled(barkPaint, x, y, 160, () => {
+    barkPaint.beginPath();
+    barkPaint.moveTo(x, y);
+    barkPaint.bezierCurveTo(x + between(-7, 7), y + length / 3, x + between(-7, 7), y + 2 * length / 3, x + between(-5, 5), y + length);
+    barkPaint.stroke();
+  });
+}
+for (let i = 0; i < 30; i++) blotch(barkPaint, between(0, 256), between(0, 512), between(8, 26), "rgba(125, 140, 108, 0.3)");
+
+// Stone: speckled grey with cracks and pale lichen
+const stonePaint = canvasOf(256, 256);
+stonePaint.fillStyle = "#63666a";
+stonePaint.fillRect(0, 0, 256, 256);
+for (let i = 0; i < 60; i++) blotch(stonePaint, between(0, 256), between(0, 256), between(15, 50), random() < 0.5 ? "rgba(30, 32, 36, 0.5)" : "rgba(150, 152, 140, 0.35)");
+for (let i = 0; i < 2500; i++) {
+  stonePaint.fillStyle = hsl(210, 5, between(15, 70), 0.5);
+  stonePaint.fillRect(between(0, 256), between(0, 256), between(1, 2.5), between(1, 2.5));
+}
+for (let i = 0; i < 25; i++) {
+  const x = between(0, 256), y = between(0, 256), angle = between(0, 7), length = between(20, 80);
+  stonePaint.strokeStyle = "rgba(15, 15, 17, 0.7)";
+  stonePaint.lineWidth = between(0.8, 2);
+  tiled(stonePaint, x, y, 80, () => stroke(stonePaint, x, y, x + length * Math.cos(angle), y + length * Math.sin(angle)));
+}
+
+// Paint a branch seen from above into one square of a canvas: a stem rising from the bottom edge that forks into twigs,
+// clothed in needles unless it is dead
+function paintBough(context, left, size, dead) {
+  context.save();
+  context.beginPath();
+  context.rect(left, 0, size, size);
+  context.clip();
+  context.lineCap = "round";
+  const twig = (x, y, angle, length, width, depth) => {
+    const sin = Math.sin(angle), cos = Math.cos(angle);
+    if (!dead) {
+      // A faint wash under the needles is cut away close up, but keeps far boughs from thinning out as the texture shrinks
+      context.strokeStyle = "rgba(18, 34, 22, 0.22)";
+      context.lineWidth = 0.03 * size;
+      stroke(context, x, y, x + sin * length, y - cos * length);
+      context.lineWidth = 0.0026 * size;
+      for (let d = 0; d < length; d += 0.0034 * size) {
+        for (const side of [-1, 1]) {
+          // Needles are paler toward the tip of a twig, where the growth is new
+          const lean = angle + side * between(0.5, 1.05), needle = between(0.01, 0.019) * size;
+          context.strokeStyle = hsl(between(100, 150), between(16, 32), between(7, 16) + 9 * (d / length) ** 3);
+          stroke(context, x + sin * d, y - cos * d, x + sin * d + Math.sin(lean) * needle, y - cos * d - Math.cos(lean) * needle);
+        }
+      }
+    }
+    context.strokeStyle = dead ? hsl(30, 10, between(18, 30)) : "#2a1d12";
+    context.lineWidth = width;
+    stroke(context, x, y, x + sin * length, y - cos * length);
+    if (depth === 3 || length < 0.03 * size) return;
+    let side = random() < 0.5 ? 1 : -1;
+    for (let d = length * (depth ? 0.25 : 0.05); d < length * 0.95; d += size * between(dead ? 0.05 : 0.028, dead ? 0.09 : 0.05)) {
+      side = -side;
+      twig(x + sin * d, y - cos * d, angle + side * between(0.65, 1.0), (length - d) * between(0.42, 0.64) + 0.012 * size, Math.max(0.003 * size, width * 0.55), depth + 1);
+    }
+  };
+  twig(left + size / 2, size, 0, size * 0.97, (dead ? 0.012 : 0.014) * size, 0);
+  context.restore();
+}
+const boughPaint = canvasOf(2048, 1024);  // left half a living bough, right half a dead branch
+paintBough(boughPaint, 0, 1024, false);
+paintBough(boughPaint, 1024, 1024, true);
+
+// Undergrowth: left half a tuft of grass, right half one fern frond
+const coverPaint = canvasOf(1024, 512);
+const tuftWash = coverPaint.createRadialGradient(256, 512, 0, 256, 512, 170);  // keeps far tufts from thinning out, like the wash under the needles
+tuftWash.addColorStop(0, "rgba(34, 46, 22, 0.25)");
+tuftWash.addColorStop(1, "rgba(34, 46, 22, 0)");
+coverPaint.fillStyle = tuftWash;
+coverPaint.fillRect(0, 0, 512, 512);
+for (let i = 0; i < 130; i++) {
+  // Thin blades fanning out from the root, a few of them dry
+  const x = 256 + between(-60, 60), tall = between(0.2, 1) ** 1.5 * 500, lean = (x - 256) * between(0.3, 1.6) + between(-0.2, 0.2) * tall, wide = between(2.5, 6);
+  coverPaint.fillStyle = random() < 0.2 ? hsl(46, 26, between(24, 38)) : hsl(between(72, 112), between(22, 40), between(11, 28));
+  coverPaint.beginPath();
+  coverPaint.moveTo(x - wide / 2, 512);
+  coverPaint.quadraticCurveTo(x + 0.3 * lean - wide / 3, 512 - 0.6 * tall, x + lean, 512 - tall);
+  coverPaint.quadraticCurveTo(x + 0.3 * lean + wide / 2, 512 - 0.6 * tall, x + wide / 2, 512);
+  coverPaint.fill();
+}
+for (let y = 495; y > 16; y -= 12) {
+  const t = 1 - y / 512, length = 215 * Math.sin(Math.PI * Math.min(1, 1.1 * t + 0.1)) ** 0.7 * (1 - 0.55 * t);
+  for (const side of [-1, 1]) {
+    const tipX = 768 + side * length * 0.95, tipY = y - length * 0.32;
+    coverPaint.fillStyle = hsl(between(98, 125), between(30, 42), between(15, 27));
+    coverPaint.beginPath();
+    coverPaint.moveTo(768, y + 5);
+    coverPaint.quadraticCurveTo(768 + side * length * 0.5, y + 6 - length * 0.16, tipX, tipY);
+    coverPaint.quadraticCurveTo(768 + side * length * 0.45, y - 9 - length * 0.16, 768, y - 5);
+    coverPaint.fill();
+  }
+}
+coverPaint.strokeStyle = "#39401f";
+coverPaint.lineWidth = 4;
+stroke(coverPaint, 768, 512, 768, 14);
+
+const soilTexture = textureOf(soil, true), barkTexture = textureOf(barkPaint, true), stoneTexture = textureOf(stonePaint, true);
+const boughTexture = textureOf(boughPaint), coverTexture = textureOf(coverPaint);
+soilTexture.repeat.setScalar(2 * (ROAM_RADIUS + 60) / 3);
+
+// Rolling ground, browner with needle litter under the trees and greener in the glades
+const groundGeometry = new THREE.PlaneGeometry(2 * (ROAM_RADIUS + 60), 2 * (ROAM_RADIUS + 60), 160, 160).rotateX(-Math.PI / 2);
+const groundTints = [], litter = new THREE.Color(0.95, 0.84, 0.74), meadow = new THREE.Color(0.72, 1.0, 0.6), tint = new THREE.Color();
+for (let i = 0; i < groundGeometry.attributes.position.count; i++) {
+  const x = groundGeometry.attributes.position.getX(i), z = groundGeometry.attributes.position.getZ(i);
+  groundGeometry.attributes.position.setY(i, groundAt(x, z));
+  tint.lerpColors(litter, meadow, smoothstep(openAt(x, z), 0.4, 0.8) * (0.45 + 0.55 * smoothstep(patchAt(x, z), -0.35, 0.25))).multiplyScalar(0.9 + 0.25 * Math.sin(0.31 * x + 1.7 * Math.sin(0.13 * z)) * Math.sin(0.27 * z));
+  groundTints.push(tint.r, tint.g, tint.b);
+}
+groundGeometry.setAttribute("color", new THREE.Float32BufferAttribute(groundTints, 3));
+groundGeometry.computeVertexNormals();
+const ground = new THREE.Mesh(groundGeometry, new THREE.MeshStandardMaterial({ map: soilTexture, bumpMap: soilTexture, bumpScale: 3, roughness: 1, vertexColors: true }));
+ground.receiveShadow = true;
+scene.add(ground);
+
+// Tube of rings around a line of upright points, swelling into roots near its start; used for trunks, stumps and logs
+function tubeGeometry(points, radii, sides, flare, capped) {
+  const positions = [], uvs = [], indices = [];
+  let along = 0;
+  points.forEach((point, i) => {
+    if (i) along += point.distanceTo(points[i - 1]);
+    for (let k = 0; k <= sides; k++) {
+      const turn = 2 * Math.PI * k / sides;
+      const radius = radii[i] * (1 + flare * Math.exp(-along / 0.5) * (0.7 + 0.3 * Math.sin(3 * turn + 1) + 0.2 * Math.sin(5 * turn)));
+      positions.push(point.x + radius * Math.cos(turn), point.y, point.z + radius * Math.sin(turn));
+      uvs.push(2 * k / sides, along / 1.4);
+    }
+    if (i) {
+      for (let k = 0; k < sides; k++) {
+        const a = (i - 1) * (sides + 1) + k, b = a + sides + 1;
+        indices.push(a, b, a + 1, a + 1, b, b + 1);
+      }
+    }
+  });
+  if (capped) {
+    for (const end of [0, points.length - 1]) {
+      const centre = positions.length / 3, ring = end * (sides + 1);
+      positions.push(points[end].x, points[end].y, points[end].z);
+      uvs.push(0.5, 0.1);
+      for (let k = 0; k < sides; k++) indices.push(centre, ring + k + (end ? 1 : 0), ring + k + (end ? 0 : 1));
+    }
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+  geometry.setIndex(indices);
+  geometry.computeVertexNormals();
+  // Each ring starts and ends on the same spot; give both vertices one normal so no seam shows up the tube
+  const normals = geometry.attributes.normal;
+  for (let i = 0; i < points.length; i++) {
+    const a = i * (sides + 1), b = a + sides;
+    const seam = new THREE.Vector3().fromBufferAttribute(normals, a).add(new THREE.Vector3().fromBufferAttribute(normals, b)).normalize();
+    normals.setXYZ(a, seam.x, seam.y, seam.z);
+    normals.setXYZ(b, seam.x, seam.y, seam.z);
+  }
+  return geometry;
+}
+
+// Collects strips of flat textured cards (boughs, grass, fronds) into one geometry
+function cardSet() {
+  const positions = [], normals = [], uvs = [], colors = [], indices = [];
+  return {
+    // Each station of a strip is [left point, right point, u at the left, u at the right, v, brightness]; the whole strip shares one normal
+    strip(stations, normal) {
+      const first = positions.length / 3;
+      stations.forEach(([left, right, uLeft, uRight, v, shade], i) => {
+        positions.push(left.x, left.y, left.z, right.x, right.y, right.z);
+        normals.push(normal.x, normal.y, normal.z, normal.x, normal.y, normal.z);
+        uvs.push(uLeft, v, uRight, v);
+        colors.push(shade, shade, shade, shade, shade, shade);
+        if (i) indices.push(first + 2 * i - 2, first + 2 * i - 1, first + 2 * i, first + 2 * i - 1, first + 2 * i + 1, first + 2 * i);
+      });
+    },
+    geometry() {
+      const geometry = new THREE.BufferGeometry();
+      for (const [name, values, size] of [["position", positions, 3], ["normal", normals, 3], ["uv", uvs, 2], ["color", colors, 3]]) {
+        geometry.setAttribute(name, new THREE.Float32BufferAttribute(values, size));
+      }
+      geometry.setIndex(indices);
+      return geometry;
+    },
+  };
+}
+
+// One conifer as [trunk, foliage]: whorls of boughs up the crown, each a ridged pair of cards with a third card of twigs
+// hanging beneath it so it has body from every side, a spire at the top, and dead branches on the bare trunk below the crown
+const UP = new THREE.Vector3(0, 1, 0);
+function buildTree({ height, girth, crown, reach, rise, droop, whorls, twigs }) {
+  const radiusAt = (y) => girth * (1 - 0.93 * Math.max(0, y) / height) ** 0.8, bendAt = (y) => 0.012 * height * Math.sin(2.2 * y / height);
+  const levels = [-0.03, 0, 0.02, 0.05, 0.12, 0.25, 0.45, 0.65, 0.85, 1].map((t) => t * height);
+  const trunk = tubeGeometry(levels.map((y) => new THREE.Vector3(bendAt(y), y, 0)), levels.map(radiusAt), 9, 0.9);
+  const cards = cardSet();
+  const bough = (y, yaw, length, rise, droop, dead) => {
+    const out = new THREE.Vector3(Math.cos(yaw), 0, Math.sin(yaw)), across = new THREE.Vector3(-out.z, 0, out.x);
+    const cell = dead ? 0.5 : 0, sag = dead ? 0 : between(0.06, 0.14), halves = [[], []], hanging = [];
+    for (let i = 0; i <= 4; i++) {
+      // Inner foliage is darker, as if shaded by the rest of the tree
+      const s = i / 4, shade = dead ? 0.8 : 0.3 + 0.7 * s;
+      const point = out.clone().multiplyScalar(0.6 * radiusAt(y) + length * s).setY(y + length * (rise * s - droop * s * s));
+      point.x += bendAt(y);
+      // The twigs to either side of the spine hang below it, more so toward the tip, so the bough is a ridge and not a flat sheet
+      halves.forEach((half, k) => {
+        const edge = point.clone().addScaledVector(across, (2 * k - 1) * 0.3 * length).addScaledVector(UP, -sag * length * (0.3 + 0.7 * s));
+        half.push(k ? [point, edge, cell + 0.25, cell + 0.5, s, shade] : [edge, point, cell, cell + 0.25, s, shade]);
+      });
+      hanging.push([point.clone().addScaledVector(UP, 0.04 * length), point.clone().addScaledVector(UP, -0.34 * length), 0.25, 0, s, 0.8 * shade]);
+    }
+    halves.forEach((half, k) => cards.strip(half, out.clone().multiplyScalar(0.55).addScaledVector(across, (2 * k - 1) * 2.5 * sag).add(UP).normalize()));
+    if (!dead) cards.strip(hanging, out.clone().multiplyScalar(0.55).add(UP).normalize());
+  };
+  for (let w = 0; w < whorls; w++) {
+    const t = w / (whorls - 1), y = height * lerp(crown, 0.96, t), count = t > 0.8 ? 4 : 5, length = reach * height * (0.1 + 0.9 * (1 - t) ** 0.8);
+    for (let b = 0; b < count; b++) {
+      bough(y + between(-0.2, 0.2), 2 * Math.PI * (b + between(-0.3, 0.3)) / count + 2.4 * w, length * between(0.75, 1.15), rise, droop * between(0.8, 1.2), false);
+    }
+  }
+  for (let i = 0; i < twigs; i++) bough(height * between(0.1, crown), between(0, 2 * Math.PI), between(0.5, 1.4), 0.1, 0.25, true);
+  if (whorls) {
+    for (const yaw of [0, Math.PI / 2]) {
+      const half = new THREE.Vector3(Math.cos(yaw), 0, Math.sin(yaw)).multiplyScalar(0.06 * height), foot = new THREE.Vector3(bendAt(height), 0.9 * height, 0);
+      const tip = foot.clone().setY(1.03 * height);
+      cards.strip([[foot.clone().sub(half), foot.clone().add(half), 0, 0.5, 0, 0.8], [tip.clone().sub(half), tip.clone().add(half), 0, 0.5, 1, 1]], UP);
+    }
+  }
+  return [trunk, cards.geometry()];
+}
+
+// Shader chunk that lights the back of a two-sided card with the same normal as its front, instead of the opposite one
+const UPLIT_NORMALS = THREE.ShaderChunk.normal_fragment_begin.replace(/gl_FrontFacing \? 1\.0 : - ?1\.0/, "1.0");
+
+// Tree materials sway in the wind: the whole tree leans from its base and, where `bob` is set, the boughs rise and fall
+function sway(material, bob) {
+  material.onBeforeCompile = (shader) => {
+    shader.uniforms.uTime = wind;
+    shader.uniforms.uBob = { value: bob };
+    shader.vertexShader = "uniform float uTime, uBob;\n" + shader.vertexShader.replace("#include <begin_vertex>", `#include <begin_vertex>
+      vec3 root = instanceMatrix[3].xyz;
+      float lean = pow(max(position.y, 0.0) / 22.0, 2.0);
+      transformed.x += lean * (0.3 * sin(0.7 * uTime + 0.05 * root.x) + 0.1 * sin(1.9 * uTime + 0.3 * root.z));
+      transformed.z += lean * 0.22 * sin(0.9 * uTime + 0.05 * root.z + 1.7);
+      transformed.y += uBob * length(position.xz) * sin(1.6 * uTime + 0.9 * position.y + root.x);`);
+    // Foliage cards are lit on both faces with the normal they were given, which points out of the crown
+    // and are left out within a few metres of the camera, so it can pass through a crown without being blinded
+    if (bob && shader.fragmentShader.includes("vViewPosition")) {
+      shader.fragmentShader = shader.fragmentShader.replace("#include <normal_fragment_begin>", UPLIT_NORMALS)
+        .replace("#include <clipping_planes_fragment>", "#include <clipping_planes_fragment>\nif (length(vViewPosition) < 3.0) discard;");
+    }
+  };
+  material.customProgramCacheKey = () => `sway ${bob > 0}`;
+  return material;
+}
+const bark = new THREE.MeshStandardMaterial({ map: barkTexture, bumpMap: barkTexture, bumpScale: 4, roughness: 1 });
+const stone = new THREE.MeshStandardMaterial({ map: stoneTexture, bumpMap: stoneTexture, bumpScale: 2, roughness: 0.95, vertexColors: true });
+const needles = sway(new THREE.MeshStandardMaterial({ map: boughTexture, alphaTest: 0.3, side: THREE.DoubleSide, roughness: 0.9, vertexColors: true }), 0.03);
+const needleShadow = sway(new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking, map: boughTexture, alphaTest: 0.3 }), 0.03);
+
+// Put copies of a model (one geometry per material) into the scene in square cells, so that cells out of sight are not drawn
+function plant(geometries, materials, copies, shadowMaterials = []) {
+  const cells = new Map();
+  for (const copy of copies) {
+    const key = `${Math.floor(copy.matrix.elements[12] / CELL)},${Math.floor(copy.matrix.elements[14] / CELL)}`;
+    if (!cells.has(key)) cells.set(key, []);
+    cells.get(key).push(copy);
+  }
+  for (const cell of cells.values()) {
+    geometries.forEach((geometry, i) => {
+      const mesh = new THREE.InstancedMesh(geometry, materials[i], cell.length);
+      cell.forEach((copy, n) => {
+        mesh.setMatrixAt(n, copy.matrix);
+        mesh.setColorAt(n, copy.tint);
+      });
+      mesh.castShadow = mesh.receiveShadow = true;
+      if (shadowMaterials[i]) mesh.customDepthMaterial = shadowMaterials[i];
+      scene.add(mesh);
+    });
+  }
+}
+// A copy standing on the ground at (x, z), sunk `sink` metres into it
+function copyAt(x, z, sink, yaw, tilt, sx, sy, sz, tint) {
+  const turn = new THREE.Quaternion().setFromEuler(new THREE.Euler(between(-tilt, tilt), yaw, between(-tilt, tilt)));
+  return { matrix: new THREE.Matrix4().compose(new THREE.Vector3(x, groundAt(x, z) - sink, z), turn, new THREE.Vector3(sx, sy, sz)), tint };
+}
+function somewhere() {
+  const distance = Math.sqrt(between(CLEARING ** 2, (ROAM_RADIUS + 25) ** 2)), bearing = between(0, 2 * Math.PI);
+  return [distance * Math.cos(bearing), distance * Math.sin(bearing)];
+}
+
+// Forest: each tree, boulder, stump and log is one or more circles the wolf and the sheep cannot walk through
+const colliders = [];
+const TREES = [  // heights and trunk radii in metres; crown is how far up the trunk the boughs start; share is how common the kind is
+  { height: 23, girth: 0.34, crown: 0.32, reach: 0.17, rise: 0.12, droop: 0.5, whorls: 20, twigs: 14, share: 0.3 },  // old spruce
+  { height: 16, girth: 0.24, crown: 0.25, reach: 0.19, rise: 0.15, droop: 0.45, whorls: 16, twigs: 10, share: 0.3 },  // spruce
+  { height: 7.5, girth: 0.11, crown: 0.07, reach: 0.24, rise: 0.2, droop: 0.4, whorls: 12, twigs: 0, share: 0.18 },  // young spruce
+  { height: 21, girth: 0.3, crown: 0.62, reach: 0.2, rise: 0.55, droop: 0.35, whorls: 9, twigs: 16, share: 0.17 },  // pine
+  { height: 12, girth: 0.22, crown: 0.95, reach: 0, rise: 0, droop: 0, whorls: 0, twigs: 24, share: 0.05 },  // dead snag
+];
+const stands = TREES.map(() => []);
+for (let planted = 0, tries = 0; planted < TREE_COUNT && tries < 40 * TREE_COUNT; tries++) {
+  const [x, z] = somewhere();
+  // Trees thin out toward the glades, and none stands within a stride of another
+  if (random() < 0.92 * smoothstep(openAt(x, z), 0.55, 0.8)) continue;
+  let kind = 0;
+  for (let pick = random(); pick > TREES[kind].share && kind < TREES.length - 1; kind++) pick -= TREES[kind].share;
+  const size = between(0.75, 1.25), radius = 1.5 * TREES[kind].girth * size;
+  if (colliders.some((c) => Math.hypot(c.x - x, c.z - z) < c.radius + radius + 1.2)) continue;
+  colliders.push({ x, z, radius, height: Infinity });
+  const shade = between(0.75, 1.1);
+  stands[kind].push(copyAt(x, z, 0, between(0, 2 * Math.PI), 0.035, size, size * between(0.9, 1.1), size, new THREE.Color(shade * between(0.9, 1.1), shade, shade * between(0.85, 1.05))));
+  planted++;
+}
+TREES.forEach((tree, kind) => plant(buildTree(tree), [sway(bark.clone(), 0), needles], stands[kind], [null, needleShadow]));
+
+// Boulders: lumpy, flat-bottomed, mossy on top
+function buildRock() {
+  const geometry = new THREE.IcosahedronGeometry(1, 2);
+  geometry.deleteAttribute("normal");
+  geometry.deleteAttribute("uv");
+  const rock = mergeVertices(geometry), points = rock.attributes.position, v = new THREE.Vector3(), [a, b, c] = [between(0, 6), between(0, 6), between(0, 6)];
+  const uvs = [], tints = [];
+  for (let i = 0; i < points.count; i++) {
+    v.fromBufferAttribute(points, i);
+    v.multiplyScalar(1 + 0.22 * Math.sin(2.3 * v.x + a) * Math.sin(2.7 * v.y + b) + 0.16 * Math.sin(3.9 * v.z + c + 1.5 * v.x) + 0.07 * Math.sin(8 * v.x + a) * Math.sin(7 * v.y + c));
+    v.y = 0.7 * Math.max(v.y, -0.3);
+    points.setXYZ(i, v.x, v.y, v.z);
+    uvs.push(0.5 * v.x + 0.2 * v.y, 0.5 * v.z + 0.3 * v.y);
+  }
+  rock.computeVertexNormals();
+  for (let i = 0; i < points.count; i++) {
+    const moss = smoothstep(rock.attributes.normal.getY(i), 0.45, 0.85) * (0.55 + 0.45 * Math.sin(5 * points.getX(i) + a) * Math.sin(4 * points.getZ(i) + b));
+    tints.push(lerp(1, 0.45, moss), lerp(1, 0.7, moss), lerp(1, 0.3, moss));
+  }
+  rock.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+  rock.setAttribute("color", new THREE.Float32BufferAttribute(tints, 3));
+  return rock;
+}
+const rocks = [[], [], []];
+for (let i = 0; i < ROCK_COUNT; i++) {
+  const [x, z] = somewhere(), size = between(0.3, 1.3), shade = between(0.6, 1);
+  rocks[i % 3].push(copyAt(x, z, 0.12 * size, between(0, 2 * Math.PI), 0.15, size, size * between(0.7, 1.1), size * between(0.75, 1), new THREE.Color(shade, shade, shade)));
+  colliders.push({ x, z, radius: 0.9 * size, height: 0.6 * size });
+}
+for (const group of rocks) plant([buildRock()], [stone], group);
+
+// Stumps and fallen logs, a little mossy
+const mossy = () => new THREE.Color(between(0.6, 0.9), between(0.75, 1.05), between(0.5, 0.8));
+const stumps = [], logs = [];
+for (let i = 0; i < STUMP_COUNT; i++) {
+  const [x, z] = somewhere(), size = between(0.7, 1.3);
+  stumps.push(copyAt(x, z, 0, between(0, 2 * Math.PI), 0.08, size, between(0.6, 1.4), size, mossy()));
+  colliders.push({ x, z, radius: 0.42 * size, height: 0.8 });
+}
+for (let i = 0; i < LOG_COUNT; i++) {
+  const [x, z] = somewhere(), yaw = between(0, 2 * Math.PI), long = between(0.6, 1.3), thick = between(0.7, 1.3);
+  logs.push(copyAt(x, z, 0.06, yaw, 0.03, long, thick, thick, mossy()));
+  // A row of circles along the log, low enough to jump
+  for (let k = -2; k <= 2; k++) colliders.push({ x: x + 1.15 * k * long * Math.cos(yaw), z: z - 1.15 * k * long * Math.sin(yaw), radius: 0.3 * thick, height: 0.5 * thick });
+}
+const upright = (ys, radii, flare) => tubeGeometry(ys.map((y) => new THREE.Vector3(0, y, 0)), radii, 10, flare, true);
+plant([upright([-0.3, 0, 0.15, 0.4, 0.6], [0.3, 0.3, 0.3, 0.29, 0.28], 0.8)], [bark], stumps);
+plant([upright([-2.9, -1.5, 0, 1.5, 2.9], [0.27, 0.26, 0.25, 0.24, 0.22], 0).rotateZ(Math.PI / 2).translate(0, 0.25, 0)], [bark], logs);
+
+// Undergrowth is drawn only around the camera: every tuft has a home in a square of ground, and the shader moves it to
+// whichever repeat of that square is nearest, stands it on the land, and shrinks it to nothing in thick forest
+const coverCentre = { value: new THREE.Vector2() };
+function undergrowth(geometry, count, open) {
+  const material = new THREE.MeshStandardMaterial({ map: coverTexture, color: 0xc4d2b4, alphaTest: 0.3, side: THREE.DoubleSide, roughness: 1, vertexColors: true });
+  material.onBeforeCompile = (shader) => {
+    Object.assign(shader.uniforms, { uCentre: coverCentre, uTime: wind, uOpen: { value: open } });
+    shader.vertexShader = `uniform vec2 uCentre;\nuniform float uTime, uOpen;\n${LAND_GLSL}` + shader.vertexShader
+      .replace("#include <begin_vertex>", `#include <begin_vertex>
+        vec2 spot = mod(instanceMatrix[3].xz - uCentre + ${glsl(COVER_REACH)}, ${glsl(2 * COVER_REACH)}) - ${glsl(COVER_REACH)} + uCentre;
+        float grown = (1.0 - smoothstep(${glsl(0.7 * COVER_REACH)}, ${glsl(0.97 * COVER_REACH)}, distance(spot, uCentre)))
+                      * smoothstep(uOpen, uOpen + 0.2, openAt(spot.x, spot.y) + instanceMatrix[3].y)
+                      * smoothstep(-0.35, 0.25, patchAt(spot.x, spot.y) + 2.0 * instanceMatrix[3].y);
+        transformed.x += 0.07 * uv.y * uv.y * sin(1.8 * uTime + 0.7 * spot.x + 0.4 * spot.y);
+        vec3 coverAt = vec3(spot.x, groundAt(spot.x, spot.y), spot.y) + mat3(instanceMatrix) * transformed * grown;`)
+      .replace("#include <project_vertex>", "vec4 mvPosition = viewMatrix * vec4(coverAt, 1.0);\ngl_Position = projectionMatrix * mvPosition;")
+      .replace("#include <worldpos_vertex>", "vec4 worldPosition = vec4(coverAt, 1.0);");
+    // Light both faces of every blade from above, like the ground it grows on
+    shader.fragmentShader = shader.fragmentShader.replace("#include <normal_fragment_begin>", UPLIT_NORMALS);
+  };
+  const mesh = new THREE.InstancedMesh(geometry, material, count), matrix = new THREE.Matrix4(), turn = new THREE.Quaternion(), tint = new THREE.Color();
+  for (let i = 0; i < count; i++) {
+    // The height of a tuft's home is not used as a height: it carries a random offset to how open the forest must be for it to grow
+    const size = 0.4 + 1.5 * random() ** 2, shade = between(0.65, 1.1);
+    mesh.setColorAt(i, tint.setRGB(shade * between(0.85, 1.15), shade, shade * between(0.6, 0.95)));
+    matrix.compose(new THREE.Vector3(between(0, 2 * COVER_REACH), between(-0.25, 0.25), between(0, 2 * COVER_REACH)),
+                   turn.setFromAxisAngle(UP, between(0, 2 * Math.PI)), new THREE.Vector3(size, size * between(0.7, 1.3), size));
+    mesh.setMatrixAt(i, matrix);
+  }
+  mesh.frustumCulled = false;
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+}
+const grass = cardSet(), fern = cardSet();
+for (let i = 0; i < 3; i++) {
+  const half = new THREE.Vector3(Math.cos(i * Math.PI / 3), 0, Math.sin(i * Math.PI / 3)).multiplyScalar(0.2), top = new THREE.Vector3(0, 0.32, 0);
+  grass.strip([[half.clone().negate(), half.clone(), 0, 0.5, 0, 0.55], [top.clone().sub(half), top.clone().add(half), 0, 0.5, 1, 1]], UP);  // dark at the root
+}
+for (let i = 0; i < 7; i++) {
+  // Fronds arch up and out from the middle of the fern and droop at their tips
+  const yaw = 2 * Math.PI * i / 7 + between(-0.3, 0.3), out = new THREE.Vector3(Math.cos(yaw), 0, Math.sin(yaw)), frond = [];
+  const half = new THREE.Vector3(-out.z, 0, out.x).multiplyScalar(0.12), long = between(0.45, 0.7);
+  for (let k = 0; k <= 3; k++) {
+    const s = k / 3, point = out.clone().multiplyScalar(0.05 + long * s).setY(long * (1.0 * s - 0.8 * s * s));
+    frond.push([point.clone().sub(half), point.clone().add(half), 0.5, 1, s, 0.45 + 0.55 * s]);
+  }
+  fern.strip(frond, UP);
+}
+undergrowth(grass.geometry(), GRASS_COUNT, 0.5);
+undergrowth(fern.geometry(), FERN_COUNT, 0.25);
+
+// Low mist: big soft sprites lying just above the ground that drift on the wind and are kept around the camera
+const mistPaint = canvasOf(128, 128), mistFill = mistPaint.createRadialGradient(64, 64, 0, 64, 64, 64);
+mistFill.addColorStop(0, "rgba(255, 255, 255, 1)");
+mistFill.addColorStop(1, "rgba(255, 255, 255, 0)");
+mistPaint.fillStyle = mistFill;
+mistPaint.fillRect(0, 0, 128, 128);
+const mistMaterial = new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(mistPaint.canvas), color: 0x9fb4dc, opacity: 0.07, depthWrite: false });
+const mist = Array.from({ length: MIST_COUNT }, () => {
+  const puff = new THREE.Sprite(mistMaterial);
+  puff.scale.set(between(10, 20), between(2.5, 5), 1);
+  Object.assign(puff.userData, { x: between(0, 2 * MIST_REACH), z: between(0, 2 * MIST_REACH), drift: between(0.15, 0.5) });
+  scene.add(puff);
+  return puff;
+});
+function driftMist(dt) {
+  for (const puff of mist) {
+    puff.userData.x += puff.userData.drift * dt;
+    const x = THREE.MathUtils.euclideanModulo(puff.userData.x - camera.position.x + MIST_REACH, 2 * MIST_REACH) - MIST_REACH + camera.position.x;
+    const z = THREE.MathUtils.euclideanModulo(puff.userData.z - camera.position.z + MIST_REACH, 2 * MIST_REACH) - MIST_REACH + camera.position.z;
+    puff.position.set(x, groundAt(x, z) + 0.3 * puff.scale.y, z);
+  }
+}
+
+// Slide a circle out of any tree, boulder, stump or log it overlaps; anything high enough clears the low ones
+function pushOut(x, z, radius, height = 0) {
+  for (const c of colliders) {
+    const dx = x - c.x, dz = z - c.z, reach = c.radius + radius, gap = dx * dx + dz * dz;
+    if (gap >= reach * reach || gap < 1e-8 || height > c.height) continue;
+    const distance = Math.sqrt(gap);
+    x = c.x + dx / distance * reach;
+    z = c.z + dz / distance * reach;
+  }
+  return [x, z];
+}
+
+// Sounds are synthesised, so there are no audio files to load; the context starts on the first key press
+let audio;
+function soundAt(delay = 0) {
+  audio ??= new AudioContext();
+  if (audio.state === "suspended") audio.resume();
+  return audio.currentTime + delay;
+}
+function voice(type, start, length, filterType, filterFrequency, resonance, volume) {
+  const source = audio.createOscillator(), filter = audio.createBiquadFilter(), level = audio.createGain();
+  source.type = type;
+  Object.assign(filter, { type: filterType });
+  filter.frequency.value = filterFrequency;
+  filter.Q.value = resonance;
+  level.gain.setValueAtTime(0, start);
+  level.gain.linearRampToValueAtTime(volume, start + Math.min(0.3, length * 0.15));
+  level.gain.setValueAtTime(volume, start + length * 0.7);
+  level.gain.linearRampToValueAtTime(0, start + length);
+  source.connect(filter).connect(level).connect(audio.destination);
+  source.start(start);
+  source.stop(start + length);
+  return { source, level };
+}
+function wobble(target, rate, depth, start, length) {
+  const wave = audio.createOscillator(), amount = audio.createGain();
+  wave.frequency.value = rate;
+  amount.gain.value = depth;
+  wave.connect(amount).connect(target);
+  wave.start(start);
+  wave.stop(start + length);
+}
+function howlSound() {
+  const start = soundAt(), { source } = voice("sawtooth", start, HOWL_TIME, "lowpass", 1100, 5, 0.2);
+  source.frequency.setValueAtTime(190, start);
+  source.frequency.exponentialRampToValueAtTime(430, start + 0.6);
+  source.frequency.linearRampToValueAtTime(455, start + 0.65 * HOWL_TIME);
+  source.frequency.exponentialRampToValueAtTime(270, start + HOWL_TIME);
+  wobble(source.frequency, 5.5, 7, start + 0.8, HOWL_TIME - 0.8);
+}
+function snapSound(delay) {
+  const start = soundAt(delay), buffer = audio.createBuffer(1, audio.sampleRate * 0.09, audio.sampleRate), samples = buffer.getChannelData(0);
+  for (let i = 0; i < samples.length; i++) samples[i] = (Math.random() * 2 - 1) * (1 - i / samples.length) ** 2;
+  const source = audio.createBufferSource(), filter = audio.createBiquadFilter(), level = audio.createGain();
+  source.buffer = buffer;
+  filter.type = "bandpass";
+  filter.frequency.value = 1900;
+  level.gain.value = 0.5;
+  source.connect(filter).connect(level).connect(audio.destination);
+  source.start(start);
+}
+function bleatSound() {
+  const start = soundAt(), { source, level } = voice("sawtooth", start, 0.5, "bandpass", 1300, 3, 0.16);
+  source.frequency.setValueAtTime(between(430, 520), start);
+  source.frequency.linearRampToValueAtTime(390, start + 0.5);
+  wobble(level.gain, 11, 0.1, start, 0.5);
+}
+
+// Sheep built from a few simple shapes: they graze and wander, bolt from the wolf, and fall over when bitten
+const wool = new THREE.MeshStandardMaterial({ color: 0xe9e6dc, roughness: 1 });
+const hide = new THREE.MeshStandardMaterial({ color: 0x24201e, roughness: 0.9 });
+const sheepParts = { body: new THREE.SphereGeometry(0.5, 12, 9), head: new THREE.SphereGeometry(0.17, 9, 7),
+                     leg: new THREE.CylinderGeometry(0.045, 0.035, 0.44, 6).translate(0, -0.22, 0), ear: new THREE.SphereGeometry(0.06, 6, 5) };
+const flock = [];
+let caught = 0;
+function placeSheep(sheep, minimumFromWolf) {
+  do {
+    const distance = Math.sqrt(between(8 ** 2, (ROAM_RADIUS - 10) ** 2)), bearing = between(0, 2 * Math.PI);
+    [sheep.x, sheep.z] = pushOut(distance * Math.cos(bearing), distance * Math.sin(bearing), 0.5);
+  } while (Math.hypot(sheep.x - wolf.position.x, sheep.z - wolf.position.z) < minimumFromWolf);
+  Object.assign(sheep, { mode: "wander", heading: between(0, 2 * Math.PI), goal: 0, speed: 0, pace: 0, timer: 0, scared: 0, veer: 0, gait: between(0, 6) });
+  sheep.model.rotation.z = 0;
+  sheep.model.scale.setScalar(sheep.size);
+  sheep.model.visible = true;
+}
+function makeSheep() {
+  const model = new THREE.Group(), add = (geometry, material, x, y, z, sx = 1, sy = 1, sz = 1) => {
+    const part = new THREE.Mesh(geometry, material);
+    part.position.set(x, y, z);
+    part.scale.set(sx, sy, sz);
+    part.castShadow = true;
+    model.add(part);
+    return part;
+  };
+  add(sheepParts.body, wool, 0, 0.66, 0, 0.84, 0.76, 1.24);
+  add(sheepParts.body, wool, 0, 0.74, -0.52, 0.2, 0.2, 0.2);
+  const head = add(sheepParts.head, hide, 0, 0.82, 0.62, 0.85, 0.95, 1.3);
+  for (const sx of [-1, 1]) add(sheepParts.ear, hide, sx * 0.17, 0.87, 0.55, 1.5, 0.5, 0.8);
+  const legs = [[-1, 1], [1, -1], [1, 1], [-1, -1]].map(([sx, sz]) => add(sheepParts.leg, hide, sx * 0.2, 0.44, sz * 0.36));
+  scene.add(model);
+  return { model, head, legs, size: between(0.85, 1.15) };
+}
+function updateSheep(sheep, dt) {
+  const { model } = sheep, awayX = sheep.x - wolf.position.x, awayZ = sheep.z - wolf.position.z, distance = Math.hypot(awayX, awayZ);
+  sheep.timer -= dt;
+  if (sheep.mode === "down") {
+    // Tip over, lie there, shrink away, then come back somewhere far from the wolf
+    const since = 7 - sheep.timer;
+    model.rotation.z = Math.min(1, since / 0.25) * Math.PI / 2;
+    model.position.y = groundAt(sheep.x, sheep.z) + 0.3 * sheep.size * Math.min(1, since / 0.25);
+    model.scale.setScalar(sheep.size * (1 - smoothstep(since, 2.5, 3.2)));
+    model.visible = since < 3.2;
+    if (sheep.timer <= 0) placeSheep(sheep, 30);
+    return;
+  }
+  sheep.scared -= dt;
+  if (distance < (riding ? ENGINE_FLEE : FLEE_DISTANCE) || sheep.scared > 0) sheep.mode = "flee";
+  else if (sheep.mode === "flee" && distance > (riding ? ENGINE_CALM : CALM_DISTANCE)) Object.assign(sheep, { mode: "wander", timer: 0 });
+  if (sheep.mode === "flee") {
+    // Run directly away, veering a little every half second so the flock scatters
+    if (sheep.timer <= 0) Object.assign(sheep, { timer: 0.5, veer: between(-0.6, 0.6) });
+    sheep.goal = Math.atan2(awayX, awayZ) + sheep.veer;
+    sheep.pace = SHEEP_SPEED;
+  } else if (sheep.timer <= 0) {
+    Object.assign(sheep, { timer: between(2, 6), goal: between(0, 2 * Math.PI), pace: random() < 0.6 ? 0 : 0.7 });
+  }
+  // Turn back towards the middle before reaching the edge of the world
+  if (Math.hypot(sheep.x, sheep.z) > ROAM_RADIUS - 5) sheep.goal = Math.atan2(-sheep.x, -sheep.z);
+  const turn = sheep.goal - sheep.heading;
+  sheep.heading += Math.atan2(Math.sin(turn), Math.cos(turn)) * Math.min(1, 6 * dt);
+  sheep.speed += (sheep.pace - sheep.speed) * Math.min(1, 5 * dt);
+  [sheep.x, sheep.z] = pushOut(sheep.x + Math.sin(sheep.heading) * sheep.speed * dt, sheep.z + Math.cos(sheep.heading) * sheep.speed * dt, 0.5);
+  // Trot the legs in diagonal pairs, bounce when running, and lower the head to graze when standing
+  sheep.gait += sheep.speed * dt * 7;
+  const swing = Math.sin(sheep.gait) * Math.min(0.8, sheep.speed * 0.5);
+  sheep.legs.forEach((leg, i) => { leg.rotation.x = i < 2 ? swing : -swing; });
+  sheep.head.position.y += ((sheep.speed < 0.1 ? 0.5 : 0.82) - sheep.head.position.y) * Math.min(1, 4 * dt);
+  model.position.set(sheep.x, groundAt(sheep.x, sheep.z) + Math.abs(Math.sin(sheep.gait)) * 0.03 * sheep.speed, sheep.z);
+  model.rotation.y = sheep.heading;
+}
+
+const wolf = new THREE.Group();
+scene.add(wolf);
+for (let i = 0; i < SHEEP_COUNT; i++) {
+  const sheep = makeSheep();
+  placeSheep(sheep, 12);
+  flock.push(sheep);
+}
+const held = new Set();
+let mixer, bones = [], byName = {}, limbs = {}, pelvis, phase = 0, blend = 0, height = 0, rise = 0, air = 0, stride = 0;
+let dancing = false, jumps = 0, bite = -1, howl = -1;
+wolf.rotation.order = "YXZ";  // turn first, then pitch and lean with the motorcycle
+
+// Motorcycle built from simple shapes like the sheep: a chopper facing +z with its origin on the ground under the saddle
+const chrome = new THREE.MeshStandardMaterial({ color: 0xc4c8ce, metalness: 1, roughness: 0.26, envMapIntensity: 0.35 });
+const alloy = new THREE.MeshStandardMaterial({ color: 0x70737a, metalness: 0.9, roughness: 0.5, envMapIntensity: 0.35, side: THREE.DoubleSide });
+const paint = new THREE.MeshPhysicalMaterial({ color: 0x7a0b0b, metalness: 0.35, roughness: 0.3, clearcoat: 1, clearcoatRoughness: 0.08, envMapIntensity: 0.6, side: THREE.DoubleSide });
+const enamel = new THREE.MeshStandardMaterial({ color: 0x0b0b0d, metalness: 0.5, roughness: 0.35 });  // gloss black on the frame
+const iron = new THREE.MeshStandardMaterial({ color: 0x1b1c1f, metalness: 0.6, roughness: 0.6 });
+const rubber = new THREE.MeshStandardMaterial({ color: 0x0c0c0d, roughness: 0.85 });
+const leather = new THREE.MeshStandardMaterial({ color: 0x1c1510, roughness: 0.7 });
+const amber = new THREE.MeshStandardMaterial({ color: 0xb85c00, roughness: 0.35 });
+const plate = new THREE.MeshStandardMaterial({ color: 0xd6d6cc, roughness: 0.6 });
+const lens = new THREE.MeshStandardMaterial({ color: 0x33302a, emissive: 0xfff0c8, emissiveIntensity: 0 });
+const tailLamp = new THREE.MeshStandardMaterial({ color: 0x300000, emissive: 0xff1a0a, emissiveIntensity: 0 });
+function makeBike() {
+  const model = new THREE.Group(), vector = (p) => new THREE.Vector3(...p);
+  const part = (geometry, material, x, y, z, tilt = 0, parent = model) => {
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.position.set(x, y, z);
+    mesh.rotation.x = tilt;
+    parent.add(mesh);
+    return mesh;
+  };
+  // A straight rod between two points
+  const strut = (from, to, radius, material, parent = model, sides = 10) => {
+    const a = vector(from), b = vector(to), rod = new THREE.Mesh(new THREE.CylinderGeometry(radius, radius, a.distanceTo(b), sides), material);
+    rod.position.lerpVectors(a, b, 0.5);
+    rod.quaternion.setFromUnitVectors(UP, b.sub(a).normalize());
+    parent.add(rod);
+    return rod;
+  };
+  // A tube bent smoothly through a row of points
+  const pipe = (points, radius, material) => part(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(points.map(vector)), 8 * points.length, radius, 10), material, 0, 0, 0);
+  // A disc or drum whose axle runs across the motorcycle
+  const drum = (radius, width, material, x, y, z, parent = model) => part(new THREE.CylinderGeometry(radius, radius, width, 24).rotateZ(Math.PI / 2), material, x, y, z, 0, parent);
+  const washer = (inner, outer, material, x, parent) => part(new THREE.RingGeometry(inner, outer, 28).rotateY(Math.PI / 2), material, x, 0, 0, 0, parent);
+  // A fender curved both around its wheel and across it, covering the wheel from `from` (0 is the front, half a turn the back)
+  const fender = (radius, bulge, half, from, sweep, y, z) => {
+    const profile = [];
+    for (let i = 0; i <= 8; i++) profile.push(new THREE.Vector2(radius + bulge * Math.cos((i / 8 - 0.5) * 2.8), half * Math.sin((i / 8 - 0.5) * 2.8)));
+    return part(new THREE.LatheGeometry(profile, 28, from * Math.PI, sweep * Math.PI).rotateZ(Math.PI / 2), paint, 0, y, z);
+  };
+  // A wire-spoked wheel that turns about its axle, with a brake disc on one side and perhaps a sprocket on the other
+  const wheel = (radius, tyre, fat, z, disc, sprocket) => {
+    const spin = new THREE.Group(), rim = radius - 2 * tyre;
+    spin.position.set(0, radius, z);
+    spin.add(new THREE.Mesh(new THREE.TorusGeometry(radius - tyre, tyre, 12, 40).rotateY(Math.PI / 2).scale(fat, 1, 1), rubber),
+             new THREE.Mesh(new THREE.TorusGeometry(rim, 0.018, 8, 40).rotateY(Math.PI / 2).scale(40 * tyre * fat, 1, 1), chrome));
+    drum(0.032, 0.17, chrome, 0, 0, 0, spin);
+    for (const sx of [-1, 1]) {
+      drum(0.052, 0.008, chrome, sx * 0.058, 0, 0, spin);
+      // Each spoke leaves the hub at a slant, alternately leading and trailing, so the spokes cross as real ones do
+      for (let k = 0; k < 16; k++) {
+        const a = (k + 0.25 * sx) * Math.PI / 8, b = a + (k % 2 ? 0.75 : -0.75);
+        strut([sx * 0.058, 0.05 * Math.cos(a), 0.05 * Math.sin(a)], [0, rim * Math.cos(b), rim * Math.sin(b)], 0.0035, chrome, spin, 4);
+      }
+    }
+    washer(0.055, 0.125, alloy, disc, spin);
+    if (sprocket) washer(0.045, 0.1, iron, sprocket, spin).material = alloy;
+    model.add(spin);
+    return spin;
+  };
+  const wheels = [wheel(0.36, 0.045, 1, FRONT_AXLE, 0.085), wheel(0.34, 0.062, 1.35, -REAR_AXLE, -0.1, 0.1)];
+  part(new THREE.BoxGeometry(0.035, 0.08, 0.05), enamel, 0.09, 0.44, FRONT_AXLE - 0.1);  // brake calipers
+  part(new THREE.BoxGeometry(0.035, 0.05, 0.08), enamel, -0.1, 0.45, -REAR_AXLE + 0.03);
+  // Rigid frame: a backbone under the tank, twin tubes down past the engine and back along its underside to the rear axle, and stays from the saddle
+  pipe([[0, 0.98, 0.8], [0, 0.8, 0.45], [0, 0.66, 0.15], [0, 0.6, -0.12]], 0.028, enamel);
+  strut([0, 0.86, 0.87], [0, 1.0, 0.75], 0.036, enamel);
+  strut([0, 0.62, -0.08], [0, 0.19, -0.08], 0.022, enamel);
+  for (const sx of [-1, 1]) {
+    pipe([[sx * 0.03, 0.92, 0.82], [sx * 0.09, 0.5, 0.66], [sx * 0.11, 0.2, 0.56], [sx * 0.11, 0.17, 0.3], [sx * 0.11, 0.19, -0.1], [sx * 0.13, 0.34, -REAR_AXLE]], 0.02, enamel);
+    pipe([[sx * 0.04, 0.62, -0.05], [sx * 0.11, 0.52, -0.25], [sx * 0.13, 0.34, -REAR_AXLE]], 0.018, enamel);
+    part(new THREE.BoxGeometry(0.012, 0.09, 0.12), enamel, sx * 0.135, 0.34, -REAR_AXLE);
+    // Raked fork: chrome tubes sliding into alloy lower legs
+    const axle = vector([sx * 0.1, 0.36, FRONT_AXLE]), top = vector([sx * 0.1, 1.02, 0.77]), knee = axle.clone().lerp(top, 0.42);
+    strut(axle.toArray(), knee.toArray(), 0.03, alloy);
+    strut(knee.toArray(), top.toArray(), 0.02, chrome);
+    // Rubber grips with a lever in front of each, a mirror, and a rubber foot peg well forward
+    strut([sx * 0.345, 1.182, 0.747], [sx * 0.425, 1.148, 0.675], 0.022, rubber);
+    strut([sx * 0.32, 1.19, 0.79], [sx * 0.43, 1.145, 0.72], 0.006, chrome);
+    strut([sx * 0.3, 1.2, 0.79], [sx * 0.37, 1.35, 0.77], 0.006, chrome);
+    part(new THREE.CylinderGeometry(0.05, 0.05, 0.012, 20).rotateX(Math.PI / 2), chrome, sx * 0.37, 1.36, 0.765);
+    pipe([[sx * 0.11, 0.2, 0.56], [sx * 0.16, 0.19, 0.74], [sx * 0.2, PEG.y, PEG.z + 0.07]], 0.014, enamel);
+    strut([sx * 0.2, PEG.y, PEG.z + 0.07], [sx * 0.36, PEG.y, PEG.z + 0.07], 0.022, rubber);
+    // Turn signals on short stalks, front and rear
+    for (const [y, z] of [[0.9, 0.95], [0.5, -0.8]]) {
+      strut([sx * 0.08, y, z], [sx * 0.17, y, z], 0.006, chrome);
+      part(new THREE.SphereGeometry(0.024, 10, 8), amber, sx * 0.17, y, z);
+    }
+  }
+  strut([-0.14, 0.36, FRONT_AXLE], [0.14, 0.36, FRONT_AXLE], 0.016, chrome);
+  strut([-0.17, 0.34, -REAR_AXLE], [0.17, 0.34, -REAR_AXLE], 0.016, chrome);
+  for (const [y, z] of [[1.0, 0.79], [0.875, 0.898]]) part(new THREE.BoxGeometry(0.27, 0.03, 0.085), chrome, 0, y, z, -0.72);
+  // Handlebars in one sweep from grip to grip, with a speedometer on the top clamp
+  pipe([[-0.42, 1.15, 0.68], [-0.34, 1.185, 0.75], [-0.26, 1.2, 0.8], [-0.1, 1.09, 0.8], [0, 1.04, 0.79], [0.1, 1.09, 0.8], [0.26, 1.2, 0.8], [0.34, 1.185, 0.75], [0.42, 1.15, 0.68]], 0.014, chrome);
+  part(new THREE.CylinderGeometry(0.042, 0.036, 0.04, 18), chrome, 0, 1.05, 0.755, -0.72);
+  part(new THREE.CircleGeometry(0.036, 18).rotateX(-Math.PI / 2), enamel, 0, 1.066, 0.741, -0.72);
+  // Throttle cable and front brake line
+  pipe([[-0.3, 1.19, 0.81], [-0.2, 1.0, 0.95], [-0.08, 0.78, 0.82], [-0.1, 0.6, 0.5]], 0.005, rubber);
+  pipe([[0.3, 1.19, 0.81], [0.22, 0.95, 1.0], [0.14, 0.62, 1.16], [0.1, 0.47, FRONT_AXLE - 0.09]], 0.005, rubber);
+  // V-twin: crankcase and gearbox, a chrome primary cover on the left, and two finned cylinders with pushrods on the right
+  drum(0.15, 0.2, alloy, 0, 0.33, 0.3);
+  drum(0.11, 0.2, alloy, 0, 0.31, 0.04);
+  part(new THREE.BoxGeometry(0.2, 0.1, 0.26), alloy, 0, 0.26, 0.17);
+  drum(0.135, 0.05, chrome, 0.125, 0.33, 0.3);
+  drum(0.1, 0.05, chrome, 0.125, 0.31, 0.04);
+  part(new THREE.BoxGeometry(0.05, 0.19, 0.26), chrome, 0.125, 0.32, 0.17);
+  drum(0.07, 0.02, chrome, 0.155, 0.33, 0.3);
+  drum(0.095, 0.03, chrome, -0.115, 0.33, 0.3);
+  for (const tilt of [-0.39, 0.39]) {
+    const barrel = new THREE.Group();
+    barrel.position.set(0, 0.36, 0.29);
+    barrel.rotation.x = tilt;
+    part(new THREE.CylinderGeometry(0.062, 0.062, 0.2, 16), iron, 0, 0.17, 0, 0, barrel);
+    for (let k = 0; k < 9; k++) part(new THREE.CylinderGeometry(0.086 - 0.004 * (k > 6), 0.086, 0.009, 20), alloy, 0, 0.09 + 0.024 * k, 0, 0, barrel);
+    part(new THREE.BoxGeometry(0.14, 0.045, 0.13), chrome, 0, 0.32, 0, 0, barrel);
+    for (const z of [-0.025, 0.025]) strut([-0.082, 0.02, z + 0.05 * Math.sign(tilt)], [-0.082, 0.3, z], 0.008, chrome, barrel);
+    model.add(barrel);
+  }
+  drum(0.085, 0.055, chrome, -0.165, 0.56, 0.29);  // air cleaner between the cylinders
+  drum(0.09, 0.2, enamel, 0, 0.46, -0.13);  // oil tank under the saddle
+  // Final drive chain on the left
+  drum(0.04, 0.012, iron, 0.1, 0.31, 0.04);
+  strut([0.1, 0.35, 0.04], [0.1, 0.44, -REAR_AXLE], 0.007, iron);
+  strut([0.1, 0.27, 0.04], [0.1, 0.24, -REAR_AXLE], 0.007, iron);
+  // Two exhausts sweep out of the heads, down the right side and back into long mufflers
+  for (const [points, y, end] of [[[[-0.07, 0.62, 0.41], [-0.17, 0.52, 0.52], [-0.2, 0.3, 0.44], [-0.21, 0.24, 0.15], [-0.21, 0.24, -0.3]], 0.24, -0.82],
+                                  [[[-0.07, 0.62, 0.17], [-0.17, 0.54, 0.08], [-0.21, 0.38, -0.1], [-0.21, 0.34, -0.35]], 0.34, -0.9]]) {
+    pipe(points, 0.026, chrome);
+    strut([-0.21, y, points.at(-1)[2] + 0.02], [-0.21, y, end], 0.04, chrome, model, 16);
+    part(new THREE.CircleGeometry(0.03, 14).rotateY(Math.PI), iron, -0.21, y, end - 0.001);
+  }
+  // Teardrop tank along the backbone, fattest towards the front, with a chrome filler cap
+  const teardrop = [];
+  for (let i = 0; i <= 18; i++) teardrop.push(new THREE.Vector2(0.155 * Math.sin(Math.PI * (i / 18) ** 1.4) ** 0.7, (i / 18 - 0.5) * 0.58));
+  const tank = part(new THREE.LatheGeometry(teardrop, 24).rotateX(Math.PI / 2).scale(1, 0.72, 1), paint, 0, 0.87, 0.48, -0.42);
+  part(new THREE.CylinderGeometry(0.03, 0.03, 0.02, 14), chrome, 0, 0.105, 0.08, 0, tank);
+  // Solo saddle with a kicked-up back, and fenders over both wheels
+  part(new THREE.SphereGeometry(1, 16, 10).scale(0.17, 0.05, 0.24), leather, 0, 0.62, -0.05);
+  part(new THREE.SphereGeometry(1, 14, 10).scale(0.16, 0.065, 0.1), leather, 0, 0.66, -0.26, -0.3);
+  fender(0.375, 0.035, 0.105, 0.24, 0.78, 0.34, -REAR_AXLE);
+  fender(0.385, 0.022, 0.062, 0.3, 0.5, 0.36, FRONT_AXLE);
+  // Round tail lamp in a chrome rim, and a number plate under it
+  part(new THREE.CylinderGeometry(0.04, 0.04, 0.03, 16).rotateX(Math.PI / 2), chrome, 0, 0.47, -REAR_AXLE - 0.4);
+  part(new THREE.CircleGeometry(0.032, 16).rotateY(Math.PI), tailLamp, 0, 0.47, -REAR_AXLE - 0.416);
+  part(new THREE.BoxGeometry(0.17, 0.1, 0.006), plate, 0, 0.37, -REAR_AXLE - 0.425, 0.15);
+  // Headlamp in a chrome shell between the fork legs, throwing a beam down the trail
+  part(new THREE.SphereGeometry(0.085, 16, 12).scale(1, 1, 1.15), chrome, 0, 0.9, 0.975);
+  part(new THREE.TorusGeometry(0.078, 0.01, 8, 24), chrome, 0, 0.9, 1.06);
+  part(new THREE.CircleGeometry(0.072, 20), lens, 0, 0.9, 1.066);
+  const beam = new THREE.SpotLight(0xffe6b8, 0, 55, 0.5, 0.7, 1.4);
+  beam.position.set(0, 0.9, 1.1);
+  beam.target.position.set(0, 0, 14);
+  const stand = strut([0.11, 0.2, 0.3], [0.3, 0.06, 0.26], 0.012, chrome);  // kickstand on the left
+  model.traverse((o) => { if (o.isMesh) o.castShadow = true; });
+  model.add(beam, beam.target);
+  model.rotation.order = "YXZ";
+  scene.add(model);
+  return { model, wheels, beam, stand, x: -2.6, z: 0.8, y: 0, heading: 0.7, speed: 0, turning: 0, pitch: 0, lean: -STAND_LEAN };
+}
+const bike = makeBike(), bikeCollider = { x: bike.x, z: bike.z, radius: 0.6, height: 0.9 };
+colliders.push(bikeCollider);
+let riding = false, rideBlend = 0, mount = 0;  // rideBlend eases the wolf into its riding pose; mount runs from 0 to 1 as it climbs on
+let hop = -1;  // progress from 0 to 1 through the heave that jumps the motorcycle, or -1 when there is none
+// To jump, the wolf first crouches over the bars, then springs up on the pegs and hauls the front wheel off the ground
+const hopCrouch = () => hop < 0 ? 0 : Math.sin(Math.PI * clamp(hop / HOP_LAUNCH, 0, 1));
+const hopLunge = () => hop < 0 ? 0 : smoothstep(hop, 0.8 * HOP_LAUNCH, 1.6 * HOP_LAUNCH) * (1 - smoothstep(hop, 0.55, 1));
+
+// Engine note: two low oscillators through a filter, chopped by a slow pulse so it thumps at idle and snarls at speed
+let engine;
+function revEngine(on, rush, throttle) {
+  if (!engine) {
+    if (!on) return;
+    const start = soundAt(), filter = audio.createBiquadFilter(), chop = audio.createGain(), level = audio.createGain(), depth = audio.createGain();
+    const [growl, thump, pulse] = ["sawtooth", "square", "sine"].map((type) => {
+      const source = audio.createOscillator();
+      source.type = type;
+      source.start(start);
+      return source;
+    });
+    filter.type = "lowpass";
+    level.gain.value = 0;
+    chop.gain.value = 0.6;
+    depth.gain.value = 0.4;
+    growl.connect(filter);
+    thump.connect(filter);
+    filter.connect(chop).connect(level).connect(audio.destination);
+    pulse.connect(depth).connect(chop.gain);
+    engine = { growl, thump, pulse, filter, level };
+  }
+  const now = audio.currentTime, pitch = 42 + 75 * rush + 8 * throttle;
+  engine.growl.frequency.setTargetAtTime(pitch, now, 0.08);
+  engine.thump.frequency.setTargetAtTime(pitch / 2, now, 0.08);
+  engine.pulse.frequency.setTargetAtTime(7 + 20 * rush, now, 0.08);
+  engine.filter.frequency.setTargetAtTime(260 + 500 * rush, now, 0.08);
+  engine.level.gain.setTargetAtTime(on ? 0.07 + 0.05 * rush : 0, now, 0.15);
+}
+
+// Drive the motorcycle: throttle and brake, steer by leaning into the turn, stop against trees, and sit both wheels on the land
+function updateBike(dt, steer, throttle) {
+  const flying = riding && height > 0;
+  if (!riding) bike.speed = 0;
+  else if (flying) steer *= 0.25;  // wheels off the ground: no drive or brakes and little steering
+  else if (throttle > 0) bike.speed = Math.min(BIKE_SPEED, bike.speed + BIKE_POWER * dt);
+  else if (throttle < 0) bike.speed = Math.max(-BIKE_REVERSE, bike.speed - (bike.speed > 0 ? BIKE_BRAKE : BIKE_POWER) * dt);
+  else bike.speed -= bike.speed * Math.min(1, 0.6 * dt);
+  // The faster it goes the wider it turns; right is towards -x when facing +z
+  bike.turning = -steer * bike.speed / Math.max(BIKE_TURN, Math.abs(bike.speed) / 1.7);
+  bike.heading += bike.turning * dt;
+  const sin = Math.sin(bike.heading), cos = Math.cos(bike.heading);
+  if (riding && dt > 0) {
+    const toX = bike.x + sin * bike.speed * dt, toZ = bike.z + cos * bike.speed * dt, edge = Math.max(1, Math.hypot(toX, toZ) / ROAM_RADIUS);
+    const [x, z] = pushOut(toX / edge, toZ / edge, BIKE_RADIUS, height);
+    // Running into something takes off the speed that did not get the motorcycle anywhere
+    const made = ((x - bike.x) * sin + (z - bike.z) * cos) / dt;
+    if (Math.abs(made) < Math.abs(bike.speed)) bike.speed = lerp(bike.speed, made, 0.5);
+    bike.x = x;
+    bike.z = z;
+  }
+  const front = groundAt(bike.x + sin * FRONT_AXLE, bike.z + cos * FRONT_AXLE), rear = groundAt(bike.x - sin * REAR_AXLE, bike.z - cos * REAR_AXLE);
+  bike.y = lerp(rear, front, REAR_AXLE / (FRONT_AXLE + REAR_AXLE));
+  // Parked, it rests on its kickstand
+  const lean = riding ? clamp(-Math.atan(bike.speed * bike.turning / 9.8), -BIKE_LEAN, BIKE_LEAN) : -STAND_LEAN;
+  bike.lean += (lean - bike.lean) * Math.min(1, 5 * dt);
+  // The fork dips as the wolf crouches and the front wheel comes up as it heaves; in the air the nose drops again for the landing
+  const pitch = -Math.atan2(front - rear, FRONT_AXLE + REAR_AXLE) - (flying ? clamp(0.07 * rise, -0.25, 0.35) : 0) + 0.05 * hopCrouch() - 0.2 * hopLunge();
+  bike.pitch += (pitch - bike.pitch) * Math.min(1, 10 * dt);
+  bike.model.position.set(bike.x, bike.y, bike.z);
+  bike.model.rotation.set(bike.pitch, bike.heading, bike.lean);
+  for (const wheel of bike.wheels) wheel.rotation.x += bike.speed * dt / wheel.position.y;
+  // Nothing can walk through it while it is parked
+  Object.assign(bikeCollider, { x: bike.x, z: bike.z, height: riding ? -1 : 0.9 });
+  bike.stand.visible = !riding;
+  bike.beam.intensity = HEADLIGHT * rideBlend;
+  lens.emissiveIntensity = 4 * rideBlend;
+  tailLamp.emissiveIntensity = riding && throttle < 0 ? 5 : 1.2 * rideBlend;
+  revEngine(riding, Math.abs(bike.speed) / BIKE_SPEED, Math.max(0, throttle));
+}
+
+// Body pose as (bone, armature axis, degrees) with parents first, plus how far the hips drop; the feet are placed afterwards
+function walkPose(p, run, air, stride, gallop, ride) {
+  const s = Math.sin(p), c = Math.cos(p), reach = 1 + 0.5 * run;
+  const rotations = [
+    ["pelvis", "Z", 6 * s], ["pelvis", "X", 12 * run],
+    ["spine_01", "X", 3 + 6 * run], ["spine_03", "Z", -9 * s], ["head", "X", 2 * Math.cos(2 * p) - 10 * run],
+    ["upperarm_l", "X", 20 * reach * s], ["lowerarm_l", "X", -14 * reach * Math.max(0, -s)],
+    ["upperarm_r", "X", -20 * reach * s], ["lowerarm_r", "X", -14 * reach * Math.max(0, s)],
+  ];
+  for (const rotation of rotations) rotation[2] *= stride * (1 - gallop);  // fade the stride out when standing still or galloping
+  // Gallop on all fours: body pitched level and rocking, limbs roughly posed here and then planted on the ground
+  rotations.push(["pelvis", "X", (48 + 6 * c) * gallop], ["spine_02", "X", -8 * s * gallop],
+                 ["neck_01", "X", -20 * gallop], ["head", "X", -28 * gallop]);
+  for (const side of ["l", "r"]) {
+    rotations.push([`upperarm_${side}`, "X", -20 * gallop], [`lowerarm_${side}`, "X", 30 * gallop],
+                   [`thigh_${side}`, "X", -55 * gallop], [`calf_${side}`, "X", 25 * gallop]);
+  }
+  for (let i = 0; i < TAIL_BONES; i++) rotations.push([`tail_0${i + 1}`, "Z", 10 * Math.sin(p - 0.7 * i)]);
+  // In the air the knees tuck up, the arms reach forward and the tail streams out behind
+  for (const side of ["l", "r"]) {
+    rotations.push([`thigh_${side}`, "X", -38 * air], [`calf_${side}`, "X", 55 * air], [`upperarm_${side}`, "X", -35 * air]);
+  }
+  rotations.push(["spine_02", "X", -8 * air], ["tail_01", "X", -25 * air]);
+  // In the saddle the wolf sits back, crouches over the tank as it speeds up, and its tail streams and flutters behind
+  const rush = ride * Math.abs(bike.speed) / BIKE_SPEED;
+  rotations.push(["pelvis", "X", -8 * ride], ["spine_01", "X", 9 * rush], ["spine_02", "X", 7 * rush], ["neck_01", "X", -6 * rush],
+                 ["head", "X", -8 * rush], ["tail_01", "X", 22 * ride + 14 * rush]);  // tail held up clear of the rear wheel
+  for (let i = 0; i < TAIL_BONES; i++) rotations.push([`tail_0${i + 1}`, "Z", 14 * rush * Math.sin(9 * wind.value - 0.9 * i)]);
+  // Jumping the motorcycle: hunch down over the bars, then throw the body up and back with the head high
+  const crouch = ride * hopCrouch(), lunge = ride * hopLunge();
+  rotations.push(["pelvis", "X", -16 * lunge], ["spine_01", "X", 14 * crouch - 8 * lunge], ["spine_02", "X", 10 * crouch - 8 * lunge],
+                 ["neck_01", "X", -6 * lunge], ["head", "X", -10 * crouch - 10 * lunge]);
+  // The mouth rests nearly shut, and hangs open and pants with each stride at a run or gallop
+  rotations.push(["jaw", "X", -JAW_SHUT * mouthShut + 2.5 * (0.8 - mouthShut) * Math.sin(2 * p)]);
+  // The hips sink when both feet are down and rise as the body passes over the standing leg
+  return { rotations, drop: stride * (1 - gallop) * (0.02 + 0.02 * run) * (1 - Math.cos(2 * p)) + gallop * (0.2 - 0.06 * s) + ride * (RIDE_DROP - 0.06 * air) + 0.07 * crouch - 0.22 * lunge };  // the heave stands it up on the pegs
+}
+
+// Turn a bone about its own joint by a rotation given in world space
+const parentQ = new THREE.Quaternion(), turnQ = new THREE.Quaternion(), wolfQ = new THREE.Quaternion(), axis = new THREE.Vector3();
+function rotateWorld(bone, rotation) {
+  bone.parent.getWorldQuaternion(parentQ);
+  bone.quaternion.premultiply(parentQ).premultiply(rotation).premultiply(parentQ.invert());
+}
+// Rotate a bone about its own joint around an axis given in the wolf's armature space
+function rotateBone(bone, axisName, degrees) {
+  rotateWorld(bone, turnQ.setFromAxisAngle(axis.copy(AXES[axisName]).applyQuaternion(wolfQ), THREE.MathUtils.degToRad(degrees)));
+}
+function rotateBones(rotations) {
+  for (const [name, axisName, degrees] of rotations) if (byName[name]) rotateBone(byName[name], axisName, degrees);
+}
+
+// Where a foot is in its step, relative to its neutral spot: planted and sliding back under the body, then lifted and swung forward
+function footCycle(cycle, start, duty, half, lift) {
+  const f = (((cycle - start) % 1) + 1) % 1;
+  if (f < duty) return { z: half * (1 - 2 * f / duty), y: 0 };
+  const t = (f - duty) / (1 - duty);
+  return { z: half * (2 * t * t * (3 - 2 * t) - 1), y: lift * Math.sin(Math.PI * t) };
+}
+
+// Bend a two-bone limb (hip and knee, or shoulder and elbow) so that its end reaches a point in world space
+const jointA = new THREE.Vector3(), jointB = new THREE.Vector3(), jointC = new THREE.Vector3(), boneA = new THREE.Vector3(), boneB = new THREE.Vector3();
+function reachFor(limb, goal) {
+  limb.upper.getWorldPosition(jointA);
+  limb.lower.getWorldPosition(jointB);
+  limb.end.getWorldPosition(jointC);
+  boneA.subVectors(jointA, jointB);
+  boneB.subVectors(jointC, jointB);
+  const upperLength = boneA.length(), lowerLength = boneB.length();
+  const span = clamp(jointA.distanceTo(goal), Math.abs(upperLength - lowerLength) + 0.001, (upperLength + lowerLength) * 0.999);
+  // Open or close the middle joint, in the plane it already bends in, until the limb spans the right distance
+  const bend = Math.acos(clamp((upperLength ** 2 + lowerLength ** 2 - span ** 2) / (2 * upperLength * lowerLength), -1, 1)) - boneA.angleTo(boneB);
+  if (axis.crossVectors(boneA, boneB).lengthSq() > 1e-10) rotateWorld(limb.lower, turnQ.setFromAxisAngle(axis.normalize(), bend));
+  // Then swing the whole limb from its top joint to point at the goal
+  limb.end.getWorldPosition(jointC);
+  rotateWorld(limb.upper, turnQ.setFromUnitVectors(jointC.sub(jointA).normalize(), boneA.subVectors(goal, jointA).normalize()));
+}
+
+// Plant the feet (and in the gallop the front paws) on the ground instead of letting them swing freely
+const goal = new THREE.Vector3(), gallopGoal = new THREE.Vector3(), rideGoal = new THREE.Vector3(), joint = new THREE.Vector3(), flatQ = new THREE.Quaternion();
+function plantLimbs(run, air, stride, gallop, ride) {
+  const cycle = phase / (2 * Math.PI), grounded = 1 - air * (1 - ride), strideLength = STRIDE * (1 + 0.9 * run), duty = 0.55 - 0.15 * run;
+  for (const side of ["l", "r"]) {
+    const foot = limbs[`foot_${side}`], step = footCycle(cycle, side === "l" ? 0.25 : 0.75, duty, duty * strideLength / 2, 0.1 + 0.08 * run);
+    goal.set(foot.rest.x, foot.rest.y + step.y * stride, foot.rest.z + step.z * stride);
+    if (gallop > 0.001) {
+      // Hind feet land one after the other beneath the hips, then the front paws beneath the shoulders
+      const bound = footCycle(cycle, side === "l" ? 0 : 0.12, 0.3, 0.42, 0.25);
+      wolf.worldToLocal(foot.upper.getWorldPosition(joint));
+      goal.lerp(gallopGoal.set(foot.rest.x, foot.rest.y + bound.y, joint.z + foot.behind + bound.z), gallop);
+    }
+    // On the motorcycle the feet rest on the pegs
+    goal.lerp(rideGoal.set(Math.sign(foot.rest.x) * PEG.x, PEG.y + foot.rest.y, PEG.z), ride);
+    reachFor(foot, foot.end.getWorldPosition(joint).lerp(wolf.localToWorld(goal), grounded));
+    // Keep the planted foot flat rather than letting it tilt with the shin
+    foot.end.parent.getWorldQuaternion(parentQ);
+    foot.end.quaternion.slerp(flatQ.copy(parentQ).invert().multiply(wolfQ).multiply(foot.flat), grounded * (1 - 0.7 * gallop));
+    if (gallop > 0.001) {
+      const paw = limbs[`hand_${side}`], bound = footCycle(cycle, side === "l" ? 0.42 : 0.54, 0.3, 0.3, 0.2);
+      wolf.worldToLocal(paw.upper.getWorldPosition(joint));
+      goal.set(joint.x * 0.9, PAW_HEIGHT + bound.y, joint.z + 0.12 + bound.z);
+      reachFor(paw, paw.end.getWorldPosition(joint).lerp(wolf.localToWorld(goal), gallop * grounded));
+    }
+  }
+}
+
+// Close the paws on the handlebar grips
+function gripBars(strength) {
+  for (const side of ["l", "r"]) {
+    const paw = limbs[`hand_${side}`];
+    goal.set(Math.sign(paw.rest.x) * GRIP.x, GRIP.y, GRIP.z);
+    reachFor(paw, paw.end.getWorldPosition(joint).lerp(wolf.localToWorld(goal), strength));
+  }
+}
+
+// Turn the head so the rider keeps watching the trail ahead, and into a bend, whatever the rest of the body is doing
+const gazeNow = new THREE.Vector3(), gazeGoal = new THREE.Vector3(), headQ = new THREE.Quaternion(), noTurn = new THREE.Quaternion();
+function watchRoad(strength) {
+  const head = byName.head, toward = bike.heading + LOOK_INTO_TURN * bike.turning;
+  const x = bike.x + LOOK_AHEAD * Math.sin(toward), z = bike.z + LOOK_AHEAD * Math.cos(toward);
+  gazeGoal.set(x, groundAt(x, z) + 0.5, z).sub(head.getWorldPosition(joint)).normalize();
+  gazeNow.copy(head.userData.gaze).applyQuaternion(head.getWorldQuaternion(headQ));
+  rotateWorld(head, turnQ.setFromUnitVectors(gazeNow, gazeGoal).slerp(noTurn, 1 - strength));
+}
+
+// Ease every bone from the dance pose the mixer just set towards the walk pose
+function applyWalk(run, air, stride, gallop, ride) {
+  wolf.updateMatrixWorld();
+  wolf.getWorldQuaternion(wolfQ);
+  for (const b of bones) {
+    b.userData.dance.copy(b.quaternion);
+    b.quaternion.copy(b.userData.rest);
+  }
+  const dancePosition = pelvis.userData.dancePosition.copy(pelvis.position);
+  const { rotations, drop } = walkPose(phase, run, air, stride, gallop, ride);
+  rotateBones(rotations);
+  pelvis.parent.getWorldQuaternion(parentQ);
+  const walkPosition = new THREE.Vector3(0, -drop, 0).applyQuaternion(wolfQ).applyQuaternion(parentQ.invert()).add(pelvis.userData.restPosition);
+  pelvis.position.copy(walkPosition);
+  plantLimbs(run, air, stride, gallop, ride);
+  for (const b of bones) b.quaternion.copy(b.userData.dance.clone().slerp(b.quaternion, blend));
+  pelvis.position.lerpVectors(dancePosition, walkPosition, blend);
+}
+
+// Attack layered on top of whatever the wolf is doing: rear back, then lunge with a bite and both claws
+function applyBite(progress) {
+  const lunge = progress < 0.25 ? -0.45 * Math.sin(Math.PI * progress / 0.25) : Math.sin(Math.PI * (progress - 0.25) / 0.75) ** 0.6;
+  const reach = Math.max(0, lunge), legs = reach * (1 - rideBlend);  // in the saddle the hips and legs stay put
+  // The jaw gapes as the wolf rears back, snaps shut as the lunge lands, and relaxes at the end
+  const jaw = progress < 0.3 ? JAW_WIDE * Math.sin(Math.PI * progress / 0.3) : -JAW_SHUT * smoothstep(progress, 0.3, 0.42) * (1 - smoothstep(progress, 0.8, 1));
+  rotateBones([
+    ["pelvis", "X", 14 * legs], ["spine_01", "X", 7 * lunge], ["spine_02", "X", 9 * lunge],
+    ["neck_01", "X", 10 * lunge], ["head", "X", 12 * lunge], ["jaw", "X", jaw],
+    ["upperarm_l", "X", -45 * lunge], ["lowerarm_l", "X", 35 * reach], ["upperarm_r", "X", -45 * lunge], ["lowerarm_r", "X", 35 * reach],
+    ["thigh_l", "X", -45 * legs], ["calf_l", "X", 25 * legs], ["thigh_r", "X", 12 * legs], ["calf_r", "X", -20 * legs],
+  ]);
+}
+
+// How far along its forward lunge the wolf is at a given point in the attack, from 0 to 1
+const lungeTravel = (progress) => smoothstep(progress, 0.25, 0.6);
+
+// Howl layered on top of the current pose: chest out, head thrown back, mouth wide, arms swept back
+function applyHowl(progress) {
+  const raise = smoothstep(progress, 0, 0.15) * (1 - smoothstep(progress, 0.85, 1));
+  rotateBones([
+    ["spine_01", "X", -8 * raise], ["spine_02", "X", -10 * raise], ["neck_01", "X", -20 * raise], ["head", "X", -34 * raise],
+    ["jaw", "X", JAW_WIDE * raise], ["upperarm_l", "X", 30 * raise], ["upperarm_r", "X", 30 * raise],
+  ]);
+  return raise;
+}
+
+// Put back the pose the dance last set, because the mixer skips bones whose dance value has not changed
+function restoreDance() {
+  for (const b of bones) b.quaternion.copy(b.userData.dance);
+  pelvis.position.copy(pelvis.userData.dancePosition);
+}
+
+// Move the wolf across the ground, stopping at the edge of the world and at trees and boulders, and bring the camera along
+function moveWolf(dx, dz) {
+  const fromX = wolf.position.x, fromZ = wolf.position.z, edge = Math.max(1, Math.hypot(fromX + dx, fromZ + dz) / ROAM_RADIUS);
+  carry(...pushOut((fromX + dx) / edge, (fromZ + dz) / edge, WOLF_RADIUS, height));
+}
+// Put the wolf at a spot on the ground and bring the camera along
+function carry(x, z) {
+  const dx = x - wolf.position.x, dz = z - wolf.position.z;
+  wolf.position.set(x, wolf.position.y, z);
+  camera.position.x += dx;
+  camera.position.z += dz;
+  controls.target.x += dx;
+  controls.target.z += dz;
+}
+
+// A bitten or run-down sheep goes over and counts towards the score
+function fell(sheep) {
+  Object.assign(sheep, { mode: "down", timer: 7 });
+  bleatSound();
+  score.textContent = `Sheep caught: ${++caught}`;
+}
+
+const loader = new GLTFLoader();
+loader.setDRACOLoader(new DRACOLoader().setDecoderPath("https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/libs/draco/gltf/"));
+loader.load("werewolf.glb", (gltf) => {
+  wolf.add(gltf.scene);
+  gltf.scene.traverse((o) => {
+    if (o.isMesh) { o.castShadow = true; o.frustumCulled = false; }
+    if (o.isBone) {
+      o.userData.rest = o.quaternion.clone();
+      o.userData.dance = o.quaternion.clone();
+      bones.push(o);
+      byName[o.name] = o;
+    }
+  });
+  pelvis = byName.pelvis;
+  pelvis.userData.restPosition = pelvis.position.clone();
+  pelvis.userData.dancePosition = pelvis.position.clone();
+  // Remember where each foot and paw rests relative to the wolf, so it can be planted there later
+  wolf.updateMatrixWorld(true);
+  wolf.getWorldQuaternion(wolfQ);
+  for (const [end, upper, lower] of [["foot", "thigh", "calf"], ["hand", "upperarm", "lowerarm"]]) {
+    for (const side of ["l", "r"]) {
+      const limb = { upper: byName[`${upper}_${side}`], lower: byName[`${lower}_${side}`], end: byName[`${end}_${side}`] };
+      limb.rest = wolf.worldToLocal(limb.end.getWorldPosition(new THREE.Vector3()));
+      limb.behind = limb.rest.z - wolf.worldToLocal(limb.upper.getWorldPosition(new THREE.Vector3())).z - 0.05;
+      limb.flat = wolfQ.clone().invert().multiply(limb.end.getWorldQuaternion(new THREE.Quaternion()));
+      limbs[`${end}_${side}`] = limb;
+    }
+  }
+  // Which way the head looks, in its own axes, taken as straight ahead in the rest pose
+  byName.head.userData.gaze = new THREE.Vector3(0, 0, 1).applyQuaternion(wolfQ).applyQuaternion(byName.head.getWorldQuaternion(new THREE.Quaternion()).invert());
+  mixer = new THREE.AnimationMixer(gltf.scene);
+  mixer.clipAction(THREE.AnimationClip.findByName(gltf.animations, "Dance") ?? gltf.animations[0]).play();
+});
+
+addEventListener("keydown", (e) => {
+  if (e.altKey || e.metaKey || e.ctrlKey) return;  // leave browser shortcuts alone
+  soundAt();
+  if (e.code === "Space") {
+    // One jump from the ground, plus one more push while in the air unless on the motorcycle
+    if (riding) {
+      if (!e.repeat && height === 0 && hop < 0) hop = 0;  // the motorcycle leaves the ground partway through the heave
+    } else if (pelvis && !e.repeat && (height === 0 || jumps === 1)) {
+      rise = JUMP_SPEED;
+      jumps = height === 0 ? 1 : 2;
+    }
+    e.preventDefault();
+  }
+  if (e.code === "KeyP" && !e.repeat) dancing = !dancing;
+  if (e.code === "KeyG" && !e.repeat) galloping = !galloping;
+  if (e.code === "KeyM" && !e.repeat && pelvis) {
+    if (!riding && height === 0 && Math.hypot(bike.x - wolf.position.x, bike.z - wolf.position.z) < MOUNT_REACH) {
+      riding = true;
+      mount = 0;
+    } else if (riding && height === 0 && hop < 0 && Math.abs(bike.speed) < MOUNT_SPEED) {
+      // Step off to the left, where the kickstand is
+      riding = false;
+      bikeCollider.height = 0.9;
+      moveWolf(1.1 * Math.cos(bike.heading), -1.1 * Math.sin(bike.heading));
+    }
+    hint.textContent = riding ? RIDE_HINT : WALK_HINT;
+  }
+  if ((e.code === "Enter" || e.code === "NumpadEnter" || e.code === "KeyX") && bite < 0 && pelvis) {
+    bite = 0;
+    snapSound(0.36 * BITE_TIME);
+  }
+  if (e.code === "KeyH" && howl < 0 && pelvis) {
+    howl = 0;
+    howlSound();
+    for (const sheep of flock) {
+      if (Math.hypot(sheep.x - wolf.position.x, sheep.z - wolf.position.z) < HOWL_RANGE) sheep.scared = between(3, 5);
+    }
+  }
+  if (!(e.code in KEYS)) return;
+  held.add(e.code);
+  e.preventDefault();  // stop the arrow keys from scrolling the page
+});
+addEventListener("keyup", (e) => {
+  held.delete(e.code);
+  if (e.key === "Meta") held.clear();  // macOS never reports other keys released while Command is down
+});
+addEventListener("blur", () => held.clear());
+let running = false, galloping = false;
+for (const type of ["keydown", "keyup"]) addEventListener(type, (e) => { running = e.shiftKey; });
+
+function resize() {
+  renderer.setSize(innerWidth, innerHeight);
+  composer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+}
+addEventListener("resize", resize);
+resize();
+
+const clock = new THREE.Clock(), forward = new THREE.Vector3(), side = new THREE.Vector3(), step = new THREE.Vector3();
+const score = document.getElementById("score"), hint = document.getElementById("hint");
+hint.textContent = WALK_HINT;
+let floor = groundAt(0, 0);  // height of the land under the wolf
+let runBlend = 0, gallopBlend = 0, mouthShut = 0.8;  // mouthShut is the share of the way the jaw is held closed
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  // Arrow keys steer relative to the camera, so up always walks away from the viewer
+  let x = 0, z = 0;
+  for (const code of held) { x += KEYS[code][0]; z += KEYS[code][1]; }
+  const moving = (x !== 0 || z !== 0) && pelvis && !riding;
+  rideBlend += ((riding ? 1 : 0) - rideBlend) * Math.min(1, BLEND_RATE * dt);
+  if (hop >= 0) {
+    // The crouch is over: launch
+    const next = hop + dt / HOP_TIME;
+    if (hop < HOP_LAUNCH && next >= HOP_LAUNCH) rise = BIKE_JUMP;
+    hop = next < 1 ? next : -1;
+  }
+  updateBike(dt, x, z);
+  if (riding) {
+    // The wolf climbs on, then goes wherever the motorcycle goes, and the camera swings round with it
+    mount = Math.min(1, mount + 3 * dt);
+    const pull = mount < 1 ? Math.min(1, 12 * dt) : 1, turn = bike.heading - wolf.rotation.y;
+    wolf.rotation.y += Math.atan2(Math.sin(turn), Math.cos(turn)) * pull;
+    carry(lerp(wolf.position.x, bike.x, pull), lerp(wolf.position.z, bike.z, pull));
+    // While it climbs on the camera comes round behind, so that up is always away from the viewer
+    const behind = bike.heading + Math.PI - Math.atan2(camera.position.x - controls.target.x, camera.position.z - controls.target.z);
+    const swing = mount < 1 ? Math.atan2(Math.sin(behind), Math.cos(behind)) * pull : bike.turning * dt;
+    camera.position.sub(controls.target).applyAxisAngle(UP, swing).add(controls.target);
+  }
+  if (riding && Math.abs(bike.speed) >= RAM_SPEED && height < 0.6) {
+    // The motorcycle knocks over sheep in its way, unless it is jumping clear over them
+    const sin = Math.sin(bike.heading), cos = Math.cos(bike.heading);
+    for (const sheep of flock) {
+      // How far the sheep is along the motorcycle, held between its two wheels, gives the nearest point on it
+      const along = clamp((sheep.x - bike.x) * sin + (sheep.z - bike.z) * cos, -REAR_AXLE, FRONT_AXLE);
+      if (sheep.mode !== "down" && Math.hypot(sheep.x - bike.x - along * sin, sheep.z - bike.z - along * cos) < RAM_REACH) fell(sheep);
+    }
+  }
+  wolf.rotation.x = rideBlend * bike.model.rotation.x;
+  wolf.rotation.z = rideBlend * bike.model.rotation.z;
+  // Rise and fall under gravity until the wolf is back on the ground
+  const lastHeight = height, lastFloor = floor;
+  height = Math.max(0, height + rise * dt);
+  floor = lerp(groundAt(wolf.position.x, wolf.position.z), bike.y, rideBlend);
+  wolf.position.y = floor + height;
+  if (riding) bike.model.position.y = bike.y + height;  // the motorcycle leaves the ground with its rider
+  // Carry the camera up and down the land with the wolf, and half as far as it jumps so a high jump stays in view
+  const lift = floor - lastFloor + 0.5 * (height - lastHeight);
+  camera.position.y += lift;
+  controls.target.y += lift;
+  rise = height > 0 ? rise - GRAVITY * dt : 0;
+  const airborne = height > 0;
+  air += ((airborne ? 1 : 0) - air) * Math.min(1, 2 * BLEND_RATE * dt);
+  stride += ((moving ? 1 : 0) - stride) * Math.min(1, BLEND_RATE * dt);
+  // With dancing off the wolf stands in its rest pose instead of returning to the dance
+  blend += ((moving || airborne || riding || !dancing ? 1 : 0) - blend) * Math.min(1, (airborne ? 3 : 1) * BLEND_RATE * dt);
+  runBlend += ((moving && running ? 1 : 0) - runBlend) * Math.min(1, BLEND_RATE * dt);
+  gallopBlend += ((moving && galloping ? 1 : 0) - gallopBlend) * Math.min(1, BLEND_RATE * dt);
+  // A bite or a howl works the jaw from its open rest, so let it fall open for those
+  mouthShut += ((bite < 0 && howl < 0 ? 0.8 * (1 - Math.max(runBlend, gallopBlend, rideBlend * Math.abs(bike.speed) / BIKE_SPEED)) : 0) - mouthShut) * Math.min(1, 2 * BLEND_RATE * dt);
+  if (moving) {
+    camera.getWorldDirection(forward).setY(0).normalize();
+    side.crossVectors(forward, camera.up);
+    step.copy(forward).multiplyScalar(z).addScaledVector(side, x).normalize();
+    // Turn the short way round towards the direction of travel
+    const turn = Math.atan2(step.x, step.z) - wolf.rotation.y;
+    wolf.rotation.y += Math.atan2(Math.sin(turn), Math.cos(turn)) * Math.min(1, TURN_RATE * dt);
+    const speed = lerp(lerp(WALK_SPEED, RUN_SPEED, runBlend), GALLOP_SPEED, gallopBlend);
+    moveWolf(step.x * speed * dt, step.z * speed * dt);
+    if (!airborne) phase += 2 * Math.PI * speed * dt / lerp(STRIDE * (1 + 0.9 * runBlend), GALLOP_STRIDE, gallopBlend);
+  }
+  if (mixer) {
+    restoreDance();
+    mixer.update(dt);
+    applyWalk(runBlend, air, stride, gallopBlend, rideBlend);
+    let grip = rideBlend;  // to howl, the paws let go of the handlebars and the eyes leave the road
+    if (howl >= 0) {
+      grip *= 1 - applyHowl(howl);
+      howl += dt / HOWL_TIME;
+      if (howl >= 1) howl = -1;
+    }
+    if (bite >= 0) {
+      applyBite(bite);
+      const next = Math.min(1, bite + dt / BITE_TIME), facingX = Math.sin(wolf.rotation.y), facingZ = Math.cos(wolf.rotation.y);
+      // Carry the wolf forward in the direction it faces, unless the motorcycle is already doing that
+      const travel = BITE_REACH * (lungeTravel(next) - lungeTravel(bite)), ahead = riding ? 1.2 : 0.7, wide = riding ? 1.3 : 1.1;
+      if (!riding) moveWolf(facingX * travel, facingZ * travel);
+      // Any sheep in front of the jaws while they close is caught
+      if (bite > 0.3 && bite < 0.8 && height < 1.2) {
+        for (const sheep of flock) {
+          if (sheep.mode === "down" || Math.hypot(sheep.x - wolf.position.x - ahead * facingX, sheep.z - wolf.position.z - ahead * facingZ) > wide) continue;
+          fell(sheep);
+        }
+      }
+      bite = next < 1 ? next : -1;
+    }
+    if (grip > 0.001) {
+      gripBars(grip);
+      watchRoad(grip);
+    }
+  }
+  for (const sheep of flock) updateSheep(sheep, dt);
+  moonlight.position.copy(wolf.position).addScaledVector(MOON_DIRECTION, 85);
+  moonlight.target.position.copy(wolf.position);
+  controls.update();
+  // Keep the camera out of rising ground
+  camera.position.y = Math.max(camera.position.y, groundAt(camera.position.x, camera.position.z) + 0.3);
+  sky.position.copy(camera.position);
+  coverCentre.value.set(camera.position.x, camera.position.z);
+  wind.value += dt;
+  driftMist(dt);
+  night.uniforms.uTime.value = wind.value;
+  composer.render();
+});
+</script>
+</body>
+</html>
