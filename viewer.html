@@ -15,12 +15,42 @@
           font: 13px/1.4 system-ui, sans-serif; pointer-events: none; }
   #hint { left: 50%; bottom: 18px; transform: translateX(-50%); max-width: calc(100% - 32px); text-align: center; }
   #score { left: 18px; top: 18px; font-size: 15px; }
+  /* Touch controls, shown only on phones, tablets and narrow windows */
+  #touch { display: none; }
+  #touch, #touch * { touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+                     -webkit-tap-highlight-color: transparent; }
+  #stick, #touch button { position: relative; border: 1px solid rgba(201, 212, 238, 0.35); border-radius: 50%;
+                          background: rgba(10, 15, 28, 0.45); color: #c9d4ee; }
+  #stick { position: fixed; left: 20px; bottom: 24px; width: 124px; height: 124px; }
+  #knob { position: absolute; left: 50%; top: 50%; width: 52px; height: 52px; margin: -26px; border-radius: 50%;
+          background: rgba(201, 212, 238, 0.5); pointer-events: none; }
+  #actions { position: fixed; right: 16px; bottom: 24px; display: grid; grid-template-columns: repeat(2, 58px); gap: 10px; }
+  #touch button { height: 58px; padding: 0; font: 600 12px/1 system-ui, sans-serif; }
+  #touch button:active, #touch button.on { background: rgba(201, 212, 238, 0.4); color: #0a0f1c; }
+  @media (pointer: coarse), (max-width: 720px) {
+    #touch { display: block; }
+    #hint { display: none; }  /* the hint lists keyboard keys, and the buttons are labelled */
+  }
+  @media (max-height: 420px) {
+    #actions { grid-template-columns: repeat(3, 58px); }  /* phones held sideways have room for two rows only */
+  }
 </style>
 </head>
 <body>
 <!-- Serve this folder over HTTP (python3 -m http.server) because browsers block loading the GLB from file:// -->
 <div id="score" class="pill">Sheep caught: 0</div>
 <div id="hint" class="pill"></div>
+<div id="touch">
+  <div id="stick"><div id="knob"></div></div>
+  <div id="actions">
+    <button data-key="KeyP">Dance</button>
+    <button data-key="KeyG">Gallop</button>
+    <button data-key="KeyH">Howl</button>
+    <button data-key="KeyM">Bike</button>
+    <button data-key="KeyX">Bite</button>
+    <button data-key="Space">Jump</button>
+  </div>
+</div>
 <script type="module">
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
@@ -1379,6 +1409,83 @@ addEventListener("blur", () => held.clear());
 let running = false, galloping = false;
 for (const type of ["keydown", "keyup"]) addEventListener(type, (e) => { running = e.shiftKey; });
 
+// Touch controls: the stick holds the arrow keys down, and each button presses the key it is named after
+const stick = document.getElementById("stick"), knob = document.getElementById("knob");
+let stickPointer = null, stickRun = false;  // pushing the stick to its rim runs
+function steer(e) {
+  const box = stick.getBoundingClientRect(), reach = box.width / 2;
+  let dx = e ? (e.clientX - box.left - reach) / reach : 0, dy = e ? (e.clientY - box.top - reach) / reach : 0;
+  const length = Math.hypot(dx, dy);
+  if (length > 1) { dx /= length; dy /= length; }
+  knob.style.transform = `translate(${dx * reach * 0.6}px, ${dy * reach * 0.6}px)`;
+  for (const code of ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"]) held.delete(code);
+  stickRun = length > 0.85;
+  if (length < 0.25) return;
+  // Eight directions: an arrow is down while the stick leans within 67.5 degrees of it
+  if (dy < -0.38 * length) held.add("ArrowUp");
+  if (dy > 0.38 * length) held.add("ArrowDown");
+  if (dx < -0.38 * length) held.add("ArrowLeft");
+  if (dx > 0.38 * length) held.add("ArrowRight");
+}
+stick.addEventListener("pointerdown", (e) => {
+  if (stickPointer !== null) return;
+  stickPointer = e.pointerId;
+  stick.setPointerCapture(e.pointerId);
+  steer(e);
+});
+stick.addEventListener("pointermove", (e) => { if (e.pointerId === stickPointer) steer(e); });
+for (const type of ["pointerup", "pointercancel"]) stick.addEventListener(type, (e) => {
+  if (e.pointerId !== stickPointer) return;
+  stickPointer = null;
+  steer(null);
+});
+for (const button of document.querySelectorAll("#actions button")) {
+  button.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    pressKey(button.dataset.key);
+  });
+}
+// Press a key on the player's behalf, then light the buttons whose modes are on
+function pressKey(code) {
+  dispatchEvent(new KeyboardEvent("keydown", { code }));
+  for (const [key, on] of [["KeyP", dancing], ["KeyG", galloping], ["KeyM", riding]]) {
+    document.querySelector(`#actions button[data-key="${key}"]`).classList.toggle("on", on);
+  }
+}
+addEventListener("pointerup", () => soundAt());  // phones only let sound start when a touch ends
+
+// Double tap or double click the ground to send the wolf there; a ring marks the spot until it arrives.
+// Double tap the motorcycle to walk over and get on, or to get off again
+const TAP_TIME = 350, TAP_SLOP = 24, GOAL_REACH = 0.3, GOAL_RUN = 6, BIKE_TAP = 1;  // milliseconds, pixels, and metres to arrive, to run from, and around the motorcycle
+const marker = new THREE.Mesh(new THREE.RingGeometry(0.22, 0.3, 32).rotateX(-Math.PI / 2),
+                              new THREE.MeshBasicMaterial({ color: 0xc9d4ee, transparent: true, opacity: 0.7, fog: false }));
+marker.visible = false;
+scene.add(marker);
+const ray = new THREE.Raycaster(), tapPoint = new THREE.Vector2();
+let errand = null, press = null, lastTap = null;
+function setErrand(spot) {
+  errand = spot;
+  marker.visible = !!errand;
+  if (errand) marker.position.set(errand.x, groundAt(errand.x, errand.z) + 0.06, errand.z);
+}
+renderer.domElement.addEventListener("pointerdown", (e) => { press = e.isPrimary ? { x: e.clientX, y: e.clientY, time: e.timeStamp } : null; });
+renderer.domElement.addEventListener("pointerup", (e) => {
+  // A tap is a short press that stays put; anything else is a drag to orbit
+  const tap = press && e.isPrimary && e.timeStamp - press.time < TAP_TIME && Math.hypot(e.clientX - press.x, e.clientY - press.y) < TAP_SLOP;
+  press = null;
+  if (!tap) { lastTap = null; return; }
+  const second = lastTap && e.timeStamp - lastTap.time < TAP_TIME && Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < TAP_SLOP;
+  lastTap = second ? null : { x: e.clientX, y: e.clientY, time: e.timeStamp };
+  if (!second || !pelvis) return;
+  ray.setFromCamera(tapPoint.set(2 * e.clientX / innerWidth - 1, 1 - 2 * e.clientY / innerHeight), camera);
+  const hit = ray.intersectObject(ground)[0];
+  // A tap on the motorcycle, or on the ground right beside it, is meant for the motorcycle
+  const onBike = ray.intersectObject(bike.model).length > 0 || (hit && Math.hypot(hit.point.x - bike.x, hit.point.z - bike.z) < BIKE_TAP);
+  if (riding) { if (onBike) pressKey("KeyM"); return; }
+  if (onBike) setErrand({ x: bike.x, z: bike.z, mount: true, nearest: Infinity, stuck: 0 });
+  else if (hit) setErrand({ x: hit.point.x, z: hit.point.z, nearest: Infinity, stuck: 0 });
+});
+
 function resize() {
   renderer.setSize(innerWidth, innerHeight);
   composer.setSize(innerWidth, innerHeight);
@@ -1398,7 +1505,18 @@ renderer.setAnimationLoop(() => {
   // Arrow keys steer relative to the camera, so up always walks away from the viewer
   let x = 0, z = 0;
   for (const code of held) { x += KEYS[code][0]; z += KEYS[code][1]; }
-  const moving = (x !== 0 || z !== 0) && pelvis && !riding;
+  if (errand) {
+    // Give up the walk on arrival, when steered by hand, or after a second without getting any nearer (a tree is in the way)
+    const left = Math.hypot(errand.x - wolf.position.x, errand.z - wolf.position.z);
+    errand.stuck = left < errand.nearest - 0.01 ? 0 : errand.stuck + dt;
+    errand.nearest = Math.min(errand.nearest, left);
+    errand.far = left > GOAL_RUN;
+    if (errand.mount && left < 0.5 * MOUNT_REACH && height === 0 && x === 0 && z === 0) {
+      setErrand(null);
+      pressKey("KeyM");
+    } else if (left < GOAL_REACH || errand.stuck > 1 || x !== 0 || z !== 0 || riding) setErrand(null);
+  }
+  const moving = (x !== 0 || z !== 0 || errand) && pelvis && !riding;
   rideBlend += ((riding ? 1 : 0) - rideBlend) * Math.min(1, BLEND_RATE * dt);
   if (hop >= 0) {
     // The crouch is over: launch
@@ -1445,7 +1563,7 @@ renderer.setAnimationLoop(() => {
   stride += ((moving ? 1 : 0) - stride) * Math.min(1, BLEND_RATE * dt);
   // With dancing off the wolf stands in its rest pose instead of returning to the dance
   blend += ((moving || airborne || riding || !dancing ? 1 : 0) - blend) * Math.min(1, (airborne ? 3 : 1) * BLEND_RATE * dt);
-  runBlend += ((moving && running ? 1 : 0) - runBlend) * Math.min(1, BLEND_RATE * dt);
+  runBlend += ((moving && (running || stickRun || errand?.far) ? 1 : 0) - runBlend) * Math.min(1, BLEND_RATE * dt);
   gallopBlend += ((moving && galloping ? 1 : 0) - gallopBlend) * Math.min(1, BLEND_RATE * dt);
   // A bite or a howl works the jaw from its open rest, so let it fall open for those
   mouthShut += ((bite < 0 && howl < 0 ? 0.8 * (1 - Math.max(runBlend, gallopBlend, rideBlend * Math.abs(bike.speed) / BIKE_SPEED)) : 0) - mouthShut) * Math.min(1, 2 * BLEND_RATE * dt);
@@ -1453,6 +1571,7 @@ renderer.setAnimationLoop(() => {
     camera.getWorldDirection(forward).setY(0).normalize();
     side.crossVectors(forward, camera.up);
     step.copy(forward).multiplyScalar(z).addScaledVector(side, x).normalize();
+    if (errand) step.set(errand.x - wolf.position.x, 0, errand.z - wolf.position.z).normalize();
     // Turn the short way round towards the direction of travel
     const turn = Math.atan2(step.x, step.z) - wolf.rotation.y;
     wolf.rotation.y += Math.atan2(Math.sin(turn), Math.cos(turn)) * Math.min(1, TURN_RATE * dt);
